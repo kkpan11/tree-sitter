@@ -6,18 +6,22 @@ use std::{
 
 use anstyle::{AnsiColor, Color, Style};
 use anyhow::{anyhow, Context, Result};
-use clap::{crate_authors, Args, Command, FromArgMatches as _, Subcommand};
+use clap::{crate_authors, Args, Command, FromArgMatches as _, Subcommand, ValueEnum};
 use clap_complete::{generate, Shell};
+use dialoguer::{theme::ColorfulTheme, Confirm, FuzzySelect, Input};
 use glob::glob;
+use heck::ToUpperCamelCase;
 use regex::Regex;
+use semver::Version;
 use tree_sitter::{ffi, Parser, Point};
 use tree_sitter_cli::{
     fuzz::{
         fuzz_language_corpus, FuzzOptions, EDIT_COUNT, ITERATION_COUNT, LOG_ENABLED,
         LOG_GRAPH_ENABLED, START_SEED,
     },
-    generate::{self, lookup_package_json_for_path},
-    highlight, logger,
+    highlight,
+    init::{generate_grammar_files, get_root_path, migrate_package_json, JsonConfigOpts},
+    logger,
     parse::{self, ParseFileOptions, ParseOutput},
     playground, query, tags,
     test::{self, TestOptions},
@@ -25,8 +29,9 @@ use tree_sitter_cli::{
 };
 use tree_sitter_config::Config;
 use tree_sitter_highlight::Highlighter;
-use tree_sitter_loader as loader;
+use tree_sitter_loader::{self as loader, TreeSitterJSON};
 use tree_sitter_tags::TagsContext;
+use url::Url;
 
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_SHA: Option<&'static str> = option_env!("BUILD_SHA");
@@ -36,6 +41,7 @@ const DEFAULT_GENERATE_ABI_VERSION: usize = 14;
 #[command(about="Generates and tests parsers", author=crate_authors!("\n"), styles=get_styles())]
 enum Commands {
     InitConfig(InitConfig),
+    Init(Init),
     Generate(Generate),
     Build(Build),
     Parse(Parse),
@@ -54,12 +60,21 @@ enum Commands {
 struct InitConfig;
 
 #[derive(Args)]
+#[command(about = "Initialize a grammar repository", alias = "i")]
+struct Init {
+    #[arg(long, short, help = "Update outdated files")]
+    pub update: bool,
+}
+
+#[derive(Args)]
 #[command(about = "Generate a parser", alias = "gen", alias = "g")]
 struct Generate {
     #[arg(index = 1, help = "The path to the grammar file")]
     pub grammar_path: Option<String>,
     #[arg(long, short, help = "Show debug log during generation")]
     pub log: bool,
+    #[arg(long, help = "Deprecated (no-op)")]
+    pub no_bindings: bool,
     #[arg(
         long = "abi",
         value_name = "VERSION",
@@ -72,8 +87,6 @@ struct Generate {
                 )
     )]
     pub abi_version: Option<String>,
-    #[arg(long, help = "Don't generate language bindings")]
-    pub no_bindings: bool,
     #[arg(
         long,
         short = 'b',
@@ -88,6 +101,13 @@ struct Generate {
         help = "The path to the directory containing the parser library"
     )]
     pub libdir: Option<String>,
+    #[arg(
+        long,
+        short,
+        value_name = "DIRECTORY",
+        help = "The path to output the generated source files"
+    )]
+    pub output: Option<String>,
     #[arg(
         long,
         help = "Produce a report of the states for the given rule, use `-` to report every rule"
@@ -178,7 +198,7 @@ struct Parse {
     )]
     pub edits: Option<Vec<String>>,
     #[arg(long, help = "The encoding of the input files")]
-    pub encoding: Option<String>,
+    pub encoding: Option<Encoding>,
     #[arg(
         long,
         help = "Open `log.html` in the default browser, if `--debug-graph` is supplied"
@@ -191,6 +211,15 @@ struct Parse {
     pub test_number: Option<u32>,
     #[arg(short, long, help = "Force rebuild the parser")]
     pub rebuild: bool,
+    #[arg(long, help = "Omit ranges in the output")]
+    pub no_ranges: bool,
+}
+
+#[derive(ValueEnum, Clone)]
+pub enum Encoding {
+    Utf8,
+    Utf16LE,
+    Utf16BE,
 }
 
 #[derive(Args)]
@@ -240,6 +269,8 @@ struct Test {
     pub show_fields: bool,
     #[arg(short, long, help = "Force rebuild the parser")]
     pub rebuild: bool,
+    #[arg(long, help = "Show only the pass-fail overview tree")]
+    pub overview_only: bool,
 }
 
 #[derive(Args)]
@@ -403,7 +434,7 @@ struct Complete {
 }
 
 impl InitConfig {
-    fn run(self) -> Result<()> {
+    fn run() -> Result<()> {
         if let Ok(Some(config_path)) = Config::find_config_file() {
             return Err(anyhow!(
                 "Remove your existing config file first: {}",
@@ -422,8 +453,243 @@ impl InitConfig {
     }
 }
 
+impl Init {
+    fn run(self, current_dir: &Path, migrated: bool) -> Result<()> {
+        let configure_json = !current_dir.join("tree-sitter.json").exists()
+            && (!current_dir.join("package.json").exists() || !migrated);
+
+        let (language_name, json_config_opts) = if configure_json {
+            let mut opts = JsonConfigOpts::default();
+
+            let name = || {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Parser name")
+                    .validate_with(|input: &String| {
+                        if input.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                            Ok(())
+                        } else {
+                            Err("The name must be lowercase and contain only letters, digits, and underscores")
+                        }
+                    })
+                    .interact_text()
+            };
+
+            let camelcase_name = |name: &str| {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("CamelCase name")
+                    .default(name.to_upper_camel_case())
+                    .validate_with(|input: &String| {
+                        if input
+                            .chars()
+                            .all(|c| c.is_ascii_alphabetic() || c.is_ascii_digit() || c == '_')
+                        {
+                            Ok(())
+                        } else {
+                            Err("The name must contain only letters, digits, and underscores")
+                        }
+                    })
+                    .interact_text()
+            };
+
+            let description = |name: &str| {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Description")
+                    .default(format!(
+                        "{} grammar for tree-sitter",
+                        name.to_upper_camel_case()
+                    ))
+                    .show_default(false)
+                    .allow_empty(true)
+                    .interact_text()
+            };
+
+            let repository = |name: &str| {
+                Input::<Url>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Repository URL")
+                    .allow_empty(true)
+                    .default(
+                        Url::parse(&format!(
+                            "https://github.com/tree-sitter/tree-sitter-{name}"
+                        ))
+                        .expect("Failed to parse default repository URL"),
+                    )
+                    .show_default(false)
+                    .interact_text()
+            };
+
+            let scope = |name: &str| {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("TextMate scope")
+                    .default(format!("source.{name}"))
+                    .validate_with(|input: &String| {
+                        if input.starts_with("source.") || input.starts_with("text.") {
+                            Ok(())
+                        } else {
+                            Err("The scope must start with 'source.' or 'text.'")
+                        }
+                    })
+                    .interact_text()
+            };
+
+            let file_types = |name: &str| {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("File types (space-separated)")
+                    .default(format!(".{name}"))
+                    .interact_text()
+                    .map(|ft| {
+                        let mut set = HashSet::new();
+                        for ext in ft.split(' ') {
+                            let ext = ext.trim();
+                            if !ext.is_empty() {
+                                set.insert(ext.to_string());
+                            }
+                        }
+                        set.into_iter().collect::<Vec<_>>()
+                    })
+            };
+
+            let initial_version = || {
+                Input::<Version>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Version")
+                    .default(Version::new(0, 1, 0))
+                    .interact_text()
+            };
+
+            let license = || {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("License")
+                    .default("MIT".to_string())
+                    .allow_empty(true)
+                    .interact()
+            };
+
+            let author = || {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Author name")
+                    .interact_text()
+            };
+
+            let email = || {
+                Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Author email")
+                    .validate_with({
+                        move |input: &String| -> Result<(), &str> {
+                            if (input.contains('@') && input.contains('.'))
+                                || input.trim().is_empty()
+                            {
+                                Ok(())
+                            } else {
+                                Err("This is not a valid email address")
+                            }
+                        }
+                    })
+                    .allow_empty(true)
+                    .interact_text()
+                    .map(|e| (!e.trim().is_empty()).then_some(e))
+            };
+
+            let url = || {
+                Input::<String>::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Author URL")
+                    .allow_empty(true)
+                    .validate_with(|input: &String| -> Result<(), &str> {
+                        if input.trim().is_empty() || Url::parse(input).is_ok() {
+                            Ok(())
+                        } else {
+                            Err("This is not a valid URL")
+                        }
+                    })
+                    .interact_text()
+                    .map(|e| (!e.trim().is_empty()).then(|| Url::parse(&e).unwrap()))
+            };
+
+            let choices = [
+                "name",
+                "camelcase",
+                "description",
+                "repository",
+                "scope",
+                "file_types",
+                "version",
+                "license",
+                "author",
+                "email",
+                "url",
+                "exit",
+            ];
+
+            macro_rules! set_choice {
+                ($choice:expr) => {
+                    match $choice {
+                        "name" => opts.name = name()?,
+                        "camelcase" => opts.camelcase = camelcase_name(&opts.name)?,
+                        "description" => opts.description = description(&opts.name)?,
+                        "repository" => opts.repository = Some(repository(&opts.name)?),
+                        "scope" => opts.scope = scope(&opts.name)?,
+                        "file_types" => opts.file_types = file_types(&opts.name)?,
+                        "version" => opts.version = initial_version()?,
+                        "license" => opts.license = license()?,
+                        "author" => opts.author = author()?,
+                        "email" => opts.email = email()?,
+                        "url" => opts.url = url()?,
+                        "exit" => break,
+                        _ => unreachable!(),
+                    }
+                };
+            }
+
+            // Initial configuration
+            for choice in choices.iter().take(choices.len() - 1) {
+                set_choice!(*choice);
+            }
+
+            // Loop for editing the configuration
+            loop {
+                println!(
+                    "Your current configuration:\n{}",
+                    serde_json::to_string_pretty(&opts)?
+                );
+
+                if Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Does the config above look correct?")
+                    .interact()?
+                {
+                    break;
+                }
+
+                let idx = FuzzySelect::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Which field would you like to change?")
+                    .items(&choices)
+                    .interact()?;
+
+                set_choice!(choices[idx]);
+            }
+
+            (opts.name.clone(), Some(opts))
+        } else {
+            let json = serde_json::from_reader::<_, TreeSitterJSON>(
+                fs::File::open(current_dir.join("tree-sitter.json"))
+                    .with_context(|| "Failed to open tree-sitter.json")?,
+            )?;
+            (json.grammars[0].name.clone(), None)
+        };
+
+        generate_grammar_files(
+            current_dir,
+            &language_name,
+            self.update,
+            json_config_opts.as_ref(),
+        )?;
+
+        Ok(())
+    }
+}
+
 impl Generate {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
+        if self.no_bindings {
+            eprint!("The --no-bindings flag is no longer used and will be removed in v0.25.0");
+        }
         if self.log {
             logger::init();
         }
@@ -437,11 +703,11 @@ impl Generate {
                         version.parse().expect("invalid abi version flag")
                     }
                 });
-        generate::generate_parser_in_directory(
-            &current_dir,
+        tree_sitter_generate::generate_parser_in_directory(
+            current_dir,
+            self.output.as_deref(),
             self.grammar_path.as_deref(),
             abi_version,
-            !self.no_bindings,
             self.report_states_for_rule.as_deref(),
             self.js_runtime.as_deref(),
         )?;
@@ -450,25 +716,24 @@ impl Generate {
                 loader = loader::Loader::with_parser_lib_path(PathBuf::from(path));
             }
             loader.debug_build(self.debug_build);
-            loader.languages_at_path(&current_dir)?;
+            loader.languages_at_path(current_dir)?;
         }
         Ok(())
     }
 }
 
 impl Build {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
         let grammar_path = current_dir.join(self.path.as_deref().unwrap_or_default());
 
         if self.wasm {
             let output_path = self.output.map(|path| current_dir.join(path));
-            let root_path = lookup_package_json_for_path(&grammar_path.join("package.json"))
-                .map(|(p, _)| p.parent().unwrap().to_path_buf())?;
+            let root_path = get_root_path(&grammar_path.join("tree-sitter.json"))?;
             wasm::compile_language_to_wasm(
                 &loader,
                 Some(&root_path),
                 &grammar_path,
-                &current_dir,
+                current_dir,
                 output_path,
                 self.docker,
             )?;
@@ -501,6 +766,7 @@ impl Build {
             };
 
             loader.debug_build(self.debug);
+            loader.force_rebuild(true);
 
             let config = Config::load(None)?;
             let loader_config = config.get()?;
@@ -514,7 +780,7 @@ impl Build {
 }
 
 impl Parse {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
         let config = Config::load(self.config_path)?;
         let color = env::var("NO_COLOR").map_or(true, |v| v != "1");
         let output = if self.output_dot {
@@ -527,15 +793,11 @@ impl Parse {
             ParseOutput::Normal
         };
 
-        let encoding = if let Some(encoding) = self.encoding {
-            match encoding.as_str() {
-                "utf16" => Some(ffi::TSInputEncodingUTF16),
-                "utf8" => Some(ffi::TSInputEncodingUTF8),
-                _ => return Err(anyhow!("Invalid encoding. Expected one of: utf8, utf16")),
-            }
-        } else {
-            None
-        };
+        let encoding = self.encoding.map(|e| match e {
+            Encoding::Utf8 => ffi::TSInputEncodingUTF8,
+            Encoding::Utf16LE => ffi::TSInputEncodingUTF16LE,
+            Encoding::Utf16BE => ffi::TSInputEncodingUTF16BE,
+        });
 
         let time = self.time;
         let edits = self.edits.unwrap_or_default();
@@ -558,7 +820,7 @@ impl Parse {
 
         let (paths, language) = if let Some(target_test) = self.test_number {
             let (test_path, language_names) = test::get_tmp_test_file(target_test, color)?;
-            let languages = loader.languages_at_path(&current_dir)?;
+            let languages = loader.languages_at_path(current_dir)?;
             let language = languages
                 .iter()
                 .find(|(_, n)| language_names.contains(&Box::from(n.as_str())))
@@ -583,7 +845,7 @@ impl Parse {
             let language = if let Some(ref language) = language {
                 language.clone()
             } else {
-                loader.select_language(path, &current_dir, self.scope.as_deref())?
+                loader.select_language(path, current_dir, self.scope.as_deref())?
             };
             parser
                 .set_language(&language)
@@ -605,6 +867,7 @@ impl Parse {
                 cancellation_flag: Some(&cancellation_flag),
                 encoding,
                 open_log: self.open_log,
+                no_ranges: self.no_ranges,
             };
 
             let parse_result = parse::parse_file_at_path(&mut parser, &opts)?;
@@ -636,7 +899,7 @@ impl Parse {
 }
 
 impl Test {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
         let config = Config::load(self.config_path)?;
         let color = env::var("NO_COLOR").map_or(true, |v| v != "1");
 
@@ -654,7 +917,7 @@ impl Test {
             loader.use_wasm(&engine);
         }
 
-        let languages = loader.languages_at_path(&current_dir)?;
+        let languages = loader.languages_at_path(current_dir)?;
         let language = &languages
             .first()
             .ok_or_else(|| anyhow!("No language found"))?
@@ -678,6 +941,7 @@ impl Test {
                 color,
                 test_num: 1,
                 show_fields: self.show_fields,
+                overview_only: self.overview_only,
             };
 
             test::run_tests_at_path(&mut parser, &mut opts)?;
@@ -758,11 +1022,11 @@ impl Test {
 }
 
 impl Fuzz {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
         loader.sanitize_build(true);
         loader.force_rebuild(self.rebuild);
 
-        let languages = loader.languages_at_path(&current_dir)?;
+        let languages = loader.languages_at_path(current_dir)?;
         let (language, language_name) = &languages
             .first()
             .ok_or_else(|| anyhow!("No language found"))?;
@@ -782,7 +1046,7 @@ impl Fuzz {
             language,
             language_name,
             *START_SEED,
-            &current_dir,
+            current_dir,
             &mut fuzz_options,
         );
         Ok(())
@@ -790,13 +1054,13 @@ impl Fuzz {
 }
 
 impl Query {
-    fn run(self, mut loader: loader::Loader, current_dir: PathBuf) -> Result<()> {
+    fn run(self, mut loader: loader::Loader, current_dir: &Path) -> Result<()> {
         let config = Config::load(self.config_path)?;
         let paths = collect_paths(self.paths_file.as_deref(), self.paths)?;
         let loader_config = config.get()?;
         loader.find_all_languages(&loader_config)?;
         let language =
-            loader.select_language(Path::new(&paths[0]), &current_dir, self.scope.as_deref())?;
+            loader.select_language(Path::new(&paths[0]), current_dir, self.scope.as_deref())?;
         let query_path = Path::new(&self.query_path);
 
         let byte_range = self.byte_range.as_ref().and_then(|range| {
@@ -956,10 +1220,10 @@ impl Tags {
 }
 
 impl Playground {
-    fn run(self, current_dir: PathBuf) -> Result<()> {
+    fn run(self, current_dir: &Path) -> Result<()> {
         let open_in_browser = !self.quiet;
-        let grammar_path = self.grammar_path.map_or(current_dir, PathBuf::from);
-        playground::serve(&grammar_path, open_in_browser)?;
+        let grammar_path = self.grammar_path.as_deref().map_or(current_dir, Path::new);
+        playground::serve(grammar_path, open_in_browser)?;
         Ok(())
     }
 }
@@ -1047,17 +1311,26 @@ fn run() -> Result<()> {
     let current_dir = env::current_dir().unwrap();
     let loader = loader::Loader::new()?;
 
+    let migrated = if !current_dir.join("tree-sitter.json").exists()
+        && current_dir.join("package.json").exists()
+    {
+        migrate_package_json(&current_dir).unwrap_or(false)
+    } else {
+        false
+    };
+
     match command {
-        Commands::InitConfig(init_config) => init_config.run()?,
-        Commands::Generate(generate_options) => generate_options.run(loader, current_dir)?,
-        Commands::Build(build_options) => build_options.run(loader, current_dir)?,
-        Commands::Parse(parse_options) => parse_options.run(loader, current_dir)?,
-        Commands::Test(test_options) => test_options.run(loader, current_dir)?,
-        Commands::Fuzz(fuzz_options) => fuzz_options.run(loader, current_dir)?,
-        Commands::Query(query_options) => query_options.run(loader, current_dir)?,
+        Commands::InitConfig(_) => InitConfig::run()?,
+        Commands::Init(init_options) => init_options.run(&current_dir, migrated)?,
+        Commands::Generate(generate_options) => generate_options.run(loader, &current_dir)?,
+        Commands::Build(build_options) => build_options.run(loader, &current_dir)?,
+        Commands::Parse(parse_options) => parse_options.run(loader, &current_dir)?,
+        Commands::Test(test_options) => test_options.run(loader, &current_dir)?,
+        Commands::Fuzz(fuzz_options) => fuzz_options.run(loader, &current_dir)?,
+        Commands::Query(query_options) => query_options.run(loader, &current_dir)?,
         Commands::Highlight(highlight_options) => highlight_options.run(loader)?,
         Commands::Tags(tags_options) => tags_options.run(loader)?,
-        Commands::Playground(playground_options) => playground_options.run(current_dir)?,
+        Commands::Playground(playground_options) => playground_options.run(&current_dir)?,
         Commands::DumpLanguages(dump_options) => dump_options.run(loader)?,
         Commands::Complete(complete_options) => complete_options.run(&mut cli),
     }
