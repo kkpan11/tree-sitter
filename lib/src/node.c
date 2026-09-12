@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include "./point.h"
 #include "./subtree.h"
 #include "./tree.h"
 #include "./language.h"
@@ -101,21 +102,6 @@ static inline bool ts_node_child_iterator_next(
   self->position = length_add(self->position, ts_subtree_size(*child));
   self->child_index++;
   return true;
-}
-
-// This will return true if the next sibling is a zero-width token that is adjacent to the current node and is relevant
-static inline bool ts_node_child_iterator_next_sibling_is_empty_adjacent(NodeChildIterator *self, TSNode previous) {
-  if (!self->parent.ptr || ts_node_child_iterator_done(self)) return false;
-  if (self->child_index == 0) return false;
-  const Subtree *child = &ts_subtree_children(self->parent)[self->child_index];
-  TSSymbol alias = 0;
-  if (!ts_subtree_extra(*child)) {
-    if (self->alias_sequence) {
-      alias = self->alias_sequence[self->structural_child_index];
-    }
-  }
-  TSNode next = ts_node_new(self->tree, child, self->position, alias);
-  return ts_node_end_byte(previous) == ts_node_end_byte(next) && ts_node__is_relevant(next, true);
 }
 
 // TSNode - private
@@ -277,8 +263,16 @@ static inline TSNode ts_node__next_sibling(TSNode self, bool include_anonymous) 
     TSNode child;
     NodeChildIterator iterator = ts_node_iterate_children(&node);
     while (ts_node_child_iterator_next(&iterator, &child)) {
-      if (iterator.position.bytes < target_end_byte) continue;
-      if (ts_node_start_byte(child) <= ts_node_start_byte(self)) {
+      if (iterator.position.bytes <= target_end_byte) continue;
+      uint32_t start_byte = ts_node_start_byte(self);
+      uint32_t child_start_byte = ts_node_start_byte(child);
+
+      bool is_empty = start_byte == target_end_byte;
+      bool contains_target = is_empty ?
+        child_start_byte < start_byte :
+        child_start_byte <= start_byte;
+
+      if (contains_target) {
         if (ts_node__subtree(child).ptr != ts_node__subtree(self).ptr) {
           child_containing_target = child;
         }
@@ -362,6 +356,9 @@ static inline TSNode ts_node__descendant_for_byte_range(
   uint32_t range_end,
   bool include_anonymous
 ) {
+  if (range_start > range_end) {
+    return ts_node__null();
+  }
   TSNode node = self;
   TSNode last_visible_node = self;
 
@@ -375,9 +372,13 @@ static inline TSNode ts_node__descendant_for_byte_range(
       uint32_t node_end = iterator.position.bytes;
 
       // The end of this node must extend far enough forward to touch
-      // the end of the range and exceed the start of the range.
+      // the end of the range
       if (node_end < range_end) continue;
-      if (node_end <= range_start) continue;
+
+      // ...and exceed the start of the range, unless the node itself is
+      // empty, in which case it must at least be equal to the start of the range.
+      bool is_empty = ts_node_start_byte(child) == node_end;
+      if (is_empty ? node_end < range_start : node_end <= range_start) continue;
 
       // The start of this node must extend far enough backward to
       // touch the start of the range.
@@ -401,6 +402,9 @@ static inline TSNode ts_node__descendant_for_point_range(
   TSPoint range_end,
   bool include_anonymous
 ) {
+  if (point_gt(range_start, range_end)) {
+    return ts_node__null();
+  }
   TSNode node = self;
   TSNode last_visible_node = self;
 
@@ -414,9 +418,15 @@ static inline TSNode ts_node__descendant_for_point_range(
       TSPoint node_end = iterator.position.extent;
 
       // The end of this node must extend far enough forward to touch
-      // the end of the range and exceed the start of the range.
+      // the end of the range
       if (point_lt(node_end, range_end)) continue;
-      if (point_lte(node_end, range_start)) continue;
+
+      // ...and exceed the start of the range, unless the node itself is
+      // empty, in which case it must at least be equal to the start of the range.
+      bool is_empty =  point_eq(ts_node_start_point(child), node_end);
+      if (is_empty ? point_lt(node_end, range_start) : point_lte(node_end, range_start)) {
+        continue;
+      }
 
       // The start of this node must extend far enough backward to
       // touch the start of the range.
@@ -457,7 +467,7 @@ const char *ts_node_type(TSNode self) {
 }
 
 const TSLanguage *ts_node_language(TSNode self) {
-  return self.tree->language;
+  return ts_tree_language(self.tree);
 }
 
 TSSymbol ts_node_grammar_symbol(TSNode self) {
@@ -539,17 +549,18 @@ TSNode ts_node_parent(TSNode self) {
   if (node.id == self.id) return ts_node__null();
 
   while (true) {
-   TSNode next_node = ts_node_child_containing_descendant(node, self);
-   if (ts_node_is_null(next_node)) break;
-   node = next_node;
+    TSNode next_node = ts_node_child_with_descendant(node, self);
+    if (next_node.id == self.id || ts_node_is_null(next_node)) break;
+    node = next_node;
   }
 
   return node;
 }
 
-TSNode ts_node_child_containing_descendant(TSNode self, TSNode subnode) {
-  uint32_t start_byte = ts_node_start_byte(subnode);
-  uint32_t end_byte = ts_node_end_byte(subnode);
+TSNode ts_node_child_with_descendant(TSNode self, TSNode descendant) {
+  uint32_t start_byte = ts_node_start_byte(descendant);
+  uint32_t end_byte = ts_node_end_byte(descendant);
+  bool is_empty = start_byte == end_byte;
 
   do {
     NodeChildIterator iter = ts_node_iterate_children(&self);
@@ -557,29 +568,23 @@ TSNode ts_node_child_containing_descendant(TSNode self, TSNode subnode) {
       if (
         !ts_node_child_iterator_next(&iter, &self)
         || ts_node_start_byte(self) > start_byte
-        || self.id == subnode.id
       ) {
         return ts_node__null();
       }
+      if (self.id == descendant.id) {
+        return self;
+      }
 
-      // Here we check the current self node and *all* of its zero-width token siblings that follow.
-      // If any of these nodes contain the target subnode, we return that node. Otherwise, we restore the node we started at
-      // for the loop condition, and that will continue with the next *non-zero-width* sibling.
-      TSNode old = self;
-      // While the next sibling is a zero-width token
-      while (ts_node_child_iterator_next_sibling_is_empty_adjacent(&iter, self)) {
-        TSNode current_node = ts_node_child_containing_descendant(self, subnode);
-        // If the target child is in self, return it
-        if (!ts_node_is_null(current_node)) {
-          return current_node;
-        }
-        ts_node_child_iterator_next(&iter, &self);
-        if (self.id == subnode.id) {
-          return ts_node__null();
+      // If the descendant is empty, and the end byte is within `self`,
+      // we check whether `self` contains it or not.
+      if (is_empty && iter.position.bytes >= end_byte && ts_node_child_count(self) > 0) {
+        TSNode child = ts_node_child_with_descendant(self, descendant);
+        // If the child is not null, return self if it's relevant, else return the child
+        if (!ts_node_is_null(child)) {
+          return ts_node__is_relevant(self, true) ? self : child;
         }
       }
-      self = old;
-    } while (iter.position.bytes < end_byte || ts_node_child_count(self) == 0);
+    } while ((is_empty ? iter.position.bytes <= end_byte : iter.position.bytes < end_byte) || ts_node_child_count(self) == 0);
   } while (!ts_node__is_relevant(self, true));
 
   return self;
@@ -856,13 +861,7 @@ void ts_node_edit(TSNode *self, const TSInputEdit *edit) {
   uint32_t start_byte = ts_node_start_byte(*self);
   TSPoint start_point = ts_node_start_point(*self);
 
-  if (start_byte >= edit->old_end_byte) {
-    start_byte = edit->new_end_byte + (start_byte - edit->old_end_byte);
-    start_point = point_add(edit->new_end_point, point_sub(start_point, edit->old_end_point));
-  } else if (start_byte > edit->start_byte) {
-    start_byte = edit->new_end_byte;
-    start_point = edit->new_end_point;
-  }
+  ts_point_edit(&start_point, &start_byte, edit);
 
   self->context[0] = start_byte;
   self->context[1] = start_point.row;

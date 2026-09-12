@@ -1,38 +1,46 @@
-#![doc = include_str!("./README.md")]
+#![cfg_attr(not(any(test, doctest)), doc = include_str!("./README.md"))]
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 pub mod ffi;
 mod util;
 
-#[cfg(not(feature = "std"))]
+#[cfg(any(
+    not(feature = "std"),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, format, string::String, string::ToString, vec::Vec};
 use core::{
-    char,
-    ffi::{c_char, c_void, CStr},
+    ffi::{CStr, c_char, c_void},
     fmt::{self, Write},
     hash, iter,
     marker::PhantomData,
     mem::MaybeUninit,
     num::NonZeroU16,
-    ops::{self, Deref},
+    ops::{self, ControlFlow, Deref},
     ptr::{self, NonNull},
     slice, str,
-    sync::atomic::AtomicUsize,
 };
 #[cfg(feature = "std")]
 use std::error;
-#[cfg(all(feature = "std", any(unix, target_os = "wasi")))]
+#[cfg(all(unix, feature = "std"))]
 use std::os::fd::AsRawFd;
 #[cfg(all(windows, feature = "std"))]
 use std::os::windows::io::AsRawHandle;
 
+pub use streaming_iterator::{StreamingIterator, StreamingIteratorMut};
 use tree_sitter_language::LanguageFn;
 
 #[cfg(feature = "wasm")]
 mod wasm_language;
 #[cfg(feature = "wasm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wasm")))]
 pub use wasm_language::*;
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod wasm_allocator;
 
 /// The latest ABI version that is supported by the current version of the
 /// library.
@@ -50,7 +58,6 @@ pub const LANGUAGE_VERSION: usize = ffi::TREE_SITTER_LANGUAGE_VERSION as usize;
 pub const MIN_COMPATIBLE_LANGUAGE_VERSION: usize =
     ffi::TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION as usize;
 
-pub const ARRAY_HEADER: &str = include_str!("../src/array.h");
 pub const PARSER_HEADER: &str = include_str!("../src/parser.h");
 
 /// An opaque object that defines how to parse a particular language. The code
@@ -61,6 +68,29 @@ pub const PARSER_HEADER: &str = include_str!("../src/parser.h");
 pub struct Language(*const ffi::TSLanguage);
 
 pub struct LanguageRef<'a>(*const ffi::TSLanguage, PhantomData<&'a ()>);
+
+/// The metadata associated with a language.
+///
+/// Currently, this metadata can be used to check the [Semantic Version](https://semver.org/)
+/// of the language. This version information should be used to signal if a given parser might
+/// be incompatible with existing queries when upgrading between major versions, or minor versions
+/// if it's in zerover.
+#[doc(alias = "TSLanguageMetadata")]
+pub struct LanguageMetadata {
+    pub major_version: u8,
+    pub minor_version: u8,
+    pub patch_version: u8,
+}
+
+impl From<ffi::TSLanguageMetadata> for LanguageMetadata {
+    fn from(val: ffi::TSLanguageMetadata) -> Self {
+        Self {
+            major_version: val.major_version,
+            minor_version: val.minor_version,
+            patch_version: val.patch_version,
+        }
+    }
+}
 
 /// A tree that represents the syntactic structure of a source code file.
 #[doc(alias = "TSTree")]
@@ -96,6 +126,48 @@ pub struct InputEdit {
     pub new_end_position: Point,
 }
 
+impl InputEdit {
+    /// Edit a point to keep it in-sync with source code that has been edited.
+    ///
+    /// This function updates a single point's byte offset and row/column position
+    /// based on this edit operation. This is useful for editing points without
+    /// requiring a tree or node instance.
+    #[doc(alias = "ts_point_edit")]
+    pub fn edit_point(&self, point: &mut Point, byte: &mut usize) {
+        let edit = self.into();
+        let mut ts_point = (*point).into();
+        let mut ts_byte = *byte as u32;
+
+        unsafe {
+            ffi::ts_point_edit(
+                core::ptr::addr_of_mut!(ts_point),
+                core::ptr::addr_of_mut!(ts_byte),
+                &raw const edit,
+            );
+        }
+
+        *point = ts_point.into();
+        *byte = ts_byte as usize;
+    }
+
+    /// Edit a range to keep it in-sync with source code that has been edited.
+    ///
+    /// This function updates a range's start and end positions based on this edit
+    /// operation. This is useful for editing ranges without requiring a tree
+    /// or node instance.
+    #[doc(alias = "ts_range_edit")]
+    pub fn edit_range(&self, range: &mut Range) {
+        let edit = self.into();
+        let mut ts_range = (*range).into();
+
+        unsafe {
+            ffi::ts_range_edit(core::ptr::addr_of_mut!(ts_range), &raw const edit);
+        }
+
+        *range = ts_range.into();
+    }
+}
+
 /// A single node within a syntax [`Tree`].
 #[doc(alias = "TSNode")]
 #[derive(Clone, Copy)]
@@ -113,6 +185,121 @@ pub struct Parser(NonNull<ffi::TSParser>);
 pub struct LookaheadIterator(NonNull<ffi::TSLookaheadIterator>);
 struct LookaheadNamesIterator<'a>(&'a mut LookaheadIterator);
 
+/// A stateful object that is passed into a [`ParseProgressCallback`]
+/// to pass in the current state of the parser.
+pub struct ParseState(NonNull<ffi::TSParseState>);
+
+impl ParseState {
+    #[must_use]
+    pub const fn current_byte_offset(&self) -> usize {
+        unsafe { self.0.as_ref() }.current_byte_offset as usize
+    }
+
+    #[must_use]
+    pub const fn has_error(&self) -> bool {
+        unsafe { self.0.as_ref() }.has_error
+    }
+}
+
+/// A stateful object that is passed into a [`QueryProgressCallback`]
+/// to pass in the current state of the query execution.
+pub struct QueryCursorState(NonNull<ffi::TSQueryCursorState>);
+
+impl QueryCursorState {
+    #[must_use]
+    pub const fn current_byte_offset(&self) -> usize {
+        unsafe { self.0.as_ref() }.current_byte_offset as usize
+    }
+}
+
+#[derive(Default)]
+pub struct ParseOptions<'a> {
+    pub progress_callback: Option<ParseProgressCallback<'a>>,
+}
+
+impl<'a> ParseOptions<'a> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn progress_callback<F: FnMut(&ParseState) -> ControlFlow<()>>(
+        mut self,
+        callback: &'a mut F,
+    ) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Create a new `ParseOptions` with a shorter lifetime, borrowing from this one.
+    ///
+    /// This is useful when you need to reuse parse options multiple times, e.g., calling
+    /// [`Parser::parse_with_options`] multiple times with the same options.
+    #[must_use]
+    pub fn reborrow(&mut self) -> ParseOptions {
+        ParseOptions {
+            progress_callback: match &mut self.progress_callback {
+                Some(cb) => Some(*cb),
+                None => None,
+            },
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct QueryCursorOptions<'a> {
+    pub progress_callback: Option<QueryProgressCallback<'a>>,
+}
+
+impl<'a> QueryCursorOptions<'a> {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn progress_callback<F: FnMut(&QueryCursorState) -> ControlFlow<()>>(
+        mut self,
+        callback: &'a mut F,
+    ) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Create a new `QueryCursorOptions` with a shorter lifetime, borrowing from this one.
+    ///
+    /// This is useful when you need to reuse query cursor options multiple times, e.g., calling
+    /// [`QueryCursor::matches`] multiple times with the same options.
+    #[must_use]
+    pub fn reborrow(&mut self) -> QueryCursorOptions {
+        QueryCursorOptions {
+            progress_callback: match &mut self.progress_callback {
+                Some(cb) => Some(*cb),
+                None => None,
+            },
+        }
+    }
+}
+
+struct QueryCursorOptionsDrop<'options>(
+    *mut ffi::TSQueryCursorOptions,
+    PhantomData<QueryProgressCallback<'options>>,
+);
+
+impl Drop for QueryCursorOptionsDrop<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if !(*self.0).payload.is_null() {
+                drop(Box::from_raw(
+                    (*self.0).payload.cast::<QueryProgressCallback>(),
+                ));
+            }
+            drop(Box::from_raw(self.0));
+        }
+    }
+}
+
 /// A type of log message.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LogType {
@@ -122,17 +309,35 @@ pub enum LogType {
 
 type FieldId = NonZeroU16;
 
-/// A callback that receives log messages during parser.
-type Logger<'a> = Box<dyn FnMut(LogType, &str) + 'a>;
+/// A callback that receives log messages during parsing.
+type Logger = Box<dyn FnMut(LogType, &str) + Send + 'static>;
+
+/// A callback that receives log messages during parsing, with relaxed constraints.
+type UnsafeLogger<'a> = Box<dyn FnMut(LogType, &str) + Send + 'a>;
+
+/// A callback that receives the parse state during parsing.
+type ParseProgressCallback<'a> = &'a mut dyn FnMut(&ParseState) -> ControlFlow<()>;
+
+/// A callback that receives the query state during query execution.
+type QueryProgressCallback<'a> = &'a mut dyn FnMut(&QueryCursorState) -> ControlFlow<()>;
+
+pub trait Decode {
+    /// A callback that decodes the next code point from the input slice. It should return the code
+    /// point, and how many bytes were decoded.
+    fn decode(bytes: &[u8]) -> (i32, u32);
+}
 
 /// A stateful object for walking a syntax [`Tree`] efficiently.
 #[doc(alias = "TSTreeCursor")]
-pub struct TreeCursor<'cursor>(ffi::TSTreeCursor, PhantomData<&'cursor ()>);
+pub struct TreeCursor<'tree>(ffi::TSTreeCursor, PhantomData<&'tree ()>);
 
 /// A set of patterns that match nodes in a syntax tree.
 #[doc(alias = "TSQuery")]
 #[derive(Debug)]
-#[allow(clippy::type_complexity)]
+#[expect(
+    clippy::type_complexity,
+    reason = "complex nested types are inherent to the query data model"
+)]
 pub struct Query {
     ptr: NonNull<ffi::TSQuery>,
     capture_names: Box<[&'static str]>,
@@ -161,7 +366,7 @@ impl From<ffi::TSQuantifier> for CaptureQuantifier {
             ffi::TSQuantifierZeroOrMore => Self::ZeroOrMore,
             ffi::TSQuantifierOne => Self::One,
             ffi::TSQuantifierOneOrMore => Self::OneOrMore,
-            _ => panic!("Unrecognized quantifier: {value}"),
+            _ => unreachable!(),
         }
     }
 }
@@ -196,29 +401,36 @@ pub struct QueryPredicate {
 /// A match of a [`Query`] to a particular set of [`Node`]s.
 pub struct QueryMatch<'cursor, 'tree> {
     pub pattern_index: usize,
-    pub captures: &'cursor [QueryCapture<'tree>],
+    captures: &'cursor [QueryCapture<'tree>],
     id: u32,
     cursor: *mut ffi::TSQueryCursor,
 }
 
 /// A sequence of [`QueryMatch`]es associated with a given [`QueryCursor`].
-pub struct QueryMatches<'query, 'cursor, T: TextProvider<I>, I: AsRef<[u8]>> {
+pub struct QueryMatches<'query, 'tree, 'options, T: TextProvider<I>, I: AsRef<[u8]>> {
     ptr: *mut ffi::TSQueryCursor,
     query: &'query Query,
     text_provider: T,
     buffer1: Vec<u8>,
     buffer2: Vec<u8>,
-    _phantom: PhantomData<(&'cursor (), I)>,
+    current_match: Option<QueryMatch<'query, 'tree>>,
+    _options: Option<QueryCursorOptionsDrop<'options>>,
+    _phantom: PhantomData<(&'tree (), I)>,
 }
 
 /// A sequence of [`QueryCapture`]s associated with a given [`QueryCursor`].
-pub struct QueryCaptures<'query, 'cursor, T: TextProvider<I>, I: AsRef<[u8]>> {
+///
+/// During iteration, each element contains a [`QueryMatch`] and index. The index can
+/// be used to access the new capture inside of the [`QueryMatch::captures`]'s [`captures`].
+pub struct QueryCaptures<'query, 'tree, 'options, T: TextProvider<I>, I: AsRef<[u8]>> {
     ptr: *mut ffi::TSQueryCursor,
     query: &'query Query,
     text_provider: T,
     buffer1: Vec<u8>,
     buffer2: Vec<u8>,
-    _phantom: PhantomData<(&'cursor (), I)>,
+    current_match: Option<(QueryMatch<'query, 'tree>, usize)>,
+    _options: Option<QueryCursorOptionsDrop<'options>>,
+    _phantom: PhantomData<(&'tree (), I)>,
 }
 
 pub trait TextProvider<I>
@@ -238,11 +450,15 @@ pub struct QueryCapture<'tree> {
     pub index: u32,
 }
 
-/// An error that occurred when trying to assign an incompatible [`Language`] to
-/// a [`Parser`].
+/// An error that occurred when trying to assign a [`Language`] to a [`Parser`].
+/// If the `wasm` feature is enabled, this can also indicate a failure to load
+/// the Wasm store.
 #[derive(Debug, PartialEq, Eq)]
-pub struct LanguageError {
-    version: usize,
+pub enum LanguageError {
+    Version(usize),
+    NotParseable,
+    #[cfg(feature = "wasm")]
+    Wasm,
 }
 
 /// An error that occurred in [`Parser::set_included_ranges`].
@@ -283,7 +499,7 @@ enum TextPredicateCapture {
     AnyString(u32, Box<[Box<str>]>, bool),
 }
 
-// TODO: Remove this struct at at some point. If `core::str::lossy::Utf8Lossy`
+// TODO: Remove this struct at some point. If `core::str::lossy::Utf8Lossy`
 // is ever stabilized.
 pub struct LossyUtf8<'a> {
     bytes: &'a [u8],
@@ -296,12 +512,46 @@ impl Language {
         Self(unsafe { builder.into_raw()().cast() })
     }
 
+    /// Check whether this language can be assigned to a parser.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, languages obtained from a
+    /// syntax tree can be used for parsing only within the same WebAssembly
+    /// instance that created the tree. In other instances, such languages can
+    /// still be used to inspect syntax trees.
+    #[doc(alias = "ts_language_is_parseable")]
+    #[must_use]
+    pub fn is_parseable(&self) -> bool {
+        unsafe { ffi::ts_language_is_parseable(self.0) }
+    }
+
+    /// Get the name of this language. This returns `None` in older parsers.
+    #[doc(alias = "ts_language_name")]
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        let ptr = unsafe { ffi::ts_language_name(self.0) };
+        (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
+    }
+
     /// Get the ABI version number that indicates which version of the
     /// Tree-sitter CLI that was used to generate this [`Language`].
-    #[doc(alias = "ts_language_version")]
+    #[doc(alias = "ts_language_abi_version")]
     #[must_use]
-    pub fn version(&self) -> usize {
-        unsafe { ffi::ts_language_version(self.0) as usize }
+    pub fn abi_version(&self) -> usize {
+        unsafe { ffi::ts_language_abi_version(self.0) as usize }
+    }
+
+    /// Get the metadata for this language. This information is generated by the
+    /// CLI, and relies on the language author providing the correct metadata in
+    /// the language's `tree-sitter.json` file.
+    ///
+    /// See also [`LanguageMetadata`].
+    #[doc(alias = "ts_language_metadata")]
+    #[must_use]
+    pub fn metadata(&self) -> Option<LanguageMetadata> {
+        unsafe {
+            let ptr = ffi::ts_language_metadata(self.0);
+            (!ptr.is_null()).then(|| (*ptr).into())
+        }
     }
 
     /// Get the number of distinct node types in this language.
@@ -318,10 +568,40 @@ impl Language {
         unsafe { ffi::ts_language_state_count(self.0) as usize }
     }
 
+    /// Get a list of all supertype symbols for the language.
+    #[doc(alias = "ts_language_supertypes")]
+    #[must_use]
+    pub fn supertypes(&self) -> &[u16] {
+        let mut length = 0u32;
+        unsafe {
+            let ptr = ffi::ts_language_supertypes(self.0, core::ptr::addr_of_mut!(length));
+            if length == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(ptr.cast_mut(), length as usize)
+            }
+        }
+    }
+
+    /// Get a list of all subtype symbols for a given supertype symbol.
+    #[doc(alias = "ts_language_supertype_map")]
+    #[must_use]
+    pub fn subtypes_for_supertype(&self, supertype: u16) -> &[u16] {
+        unsafe {
+            let mut length = 0u32;
+            let ptr = ffi::ts_language_subtypes(self.0, supertype, core::ptr::addr_of_mut!(length));
+            if length == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(ptr.cast_mut(), length as usize)
+            }
+        }
+    }
+
     /// Get the name of the node kind for the given numerical id.
     #[doc(alias = "ts_language_symbol_name")]
     #[must_use]
-    pub fn node_kind_for_id(&self, id: u16) -> Option<&'static str> {
+    pub fn node_kind_for_id(&self, id: u16) -> Option<&str> {
         let ptr = unsafe { ffi::ts_language_symbol_name(self.0, id) };
         (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
@@ -340,17 +620,37 @@ impl Language {
         }
     }
 
+    /// Check whether `id` can be used to index this language's symbol tables.
+    ///
+    /// `ts_symbol_metadata` holds one entry per grammar symbol plus one per alias,
+    /// so [`Self::node_kind_count`] is an exact bound. `ERROR` and `_ERROR` sit
+    /// at the top of the `u16` range and are handled by the C library before any
+    /// table lookup.
+    fn node_kind_id_is_valid(&self, id: u16) -> bool {
+        (id as usize) < self.node_kind_count() || id >= u16::MAX - 1
+    }
+
     /// Check if the node type for the given numerical id is named (as opposed
     /// to an anonymous node type).
     #[must_use]
     pub fn node_kind_is_named(&self, id: u16) -> bool {
-        unsafe { ffi::ts_language_symbol_type(self.0, id) == ffi::TSSymbolTypeRegular }
+        self.node_kind_id_is_valid(id)
+            && unsafe { ffi::ts_language_symbol_type(self.0, id) == ffi::TSSymbolTypeRegular }
     }
 
-    #[doc(alias = "ts_language_symbol_type")]
+    /// Check if the node type for the given numerical id is visible (as opposed
+    /// to a hidden node type).
     #[must_use]
     pub fn node_kind_is_visible(&self, id: u16) -> bool {
-        unsafe { ffi::ts_language_symbol_type(self.0, id) <= ffi::TSSymbolTypeAnonymous }
+        self.node_kind_id_is_valid(id)
+            && unsafe { ffi::ts_language_symbol_type(self.0, id) <= ffi::TSSymbolTypeAnonymous }
+    }
+
+    /// Check if the node type for the given numerical id is a supertype.
+    #[must_use]
+    pub fn node_kind_is_supertype(&self, id: u16) -> bool {
+        self.node_kind_id_is_valid(id)
+            && unsafe { ffi::ts_language_symbol_type(self.0, id) == ffi::TSSymbolTypeSupertype }
     }
 
     /// Get the number of distinct field names in this language.
@@ -360,10 +660,10 @@ impl Language {
         unsafe { ffi::ts_language_field_count(self.0) as usize }
     }
 
-    /// Get the field names for the given numerical id.
+    /// Get the field name for the given numerical id.
     #[doc(alias = "ts_language_field_name_for_id")]
     #[must_use]
-    pub fn field_name_for_id(&self, field_id: u16) -> Option<&'static str> {
+    pub fn field_name_for_id(&self, field_id: u16) -> Option<&str> {
         let ptr = unsafe { ffi::ts_language_field_name_for_id(self.0, field_id) };
         (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr) }.to_str().unwrap())
     }
@@ -388,7 +688,7 @@ impl Language {
     /// generate completion suggestions or valid symbols in error nodes.
     ///
     /// Example:
-    /// ```
+    /// ```ignore
     /// let state = language.next_state(node.parse_state(), node.grammar_id());
     /// ```
     #[doc(alias = "ts_language_next_state")]
@@ -402,14 +702,20 @@ impl Language {
     /// This returns `None` if state is invalid for this language.
     ///
     /// Iterating [`LookaheadIterator`] will yield valid symbols in the given
-    /// parse state. Newly created lookahead iterators will return the `ERROR`
-    /// symbol from [`LookaheadIterator::current_symbol`].
+    /// parse state. A newly created iterator is not positioned on a symbol, so
+    /// [`LookaheadIterator::current_symbol`] returns `None` until the first
+    /// [`Iterator::next`] call.
+    ///
+    /// The iterator retains the language, so the language may be dropped while
+    /// the iterator is still in use.
     ///
     /// Lookahead iterators can be useful to generate suggestions and improve
-    /// syntax error diagnostics. To get symbols valid in an ERROR node, use the
-    /// lookahead iterator on its first leaf node state. For `MISSING` nodes, a
-    /// lookahead iterator created on the previous non-extra leaf node may be
-    /// appropriate.
+    /// syntax error diagnostics. To get symbols valid in an `ERROR` node, use the
+    /// lookahead iterator on its first leaf node state. For a missing node, use
+    /// the node's [`parse_state`](Node::parse_state). Keep in mind that lookahead
+    /// symbols are valid in that parse state, but are not necessarily valid
+    /// continuations in the context of the actual following token or guaranteed
+    /// to be considered during error recovery.
     #[doc(alias = "ts_lookahead_iterator_new")]
     #[must_use]
     pub fn lookahead_iterator(&self, state: u16) -> Option<LookaheadIterator> {
@@ -436,7 +742,7 @@ impl Drop for Language {
     }
 }
 
-impl<'a> Deref for LanguageRef<'a> {
+impl Deref for LanguageRef<'_> {
     type Target = Language;
 
     fn deref(&self) -> &Self::Target {
@@ -464,32 +770,38 @@ impl Parser {
     /// Set the language that the parser should use for parsing.
     ///
     /// Returns a Result indicating whether or not the language was successfully
-    /// assigned. True means assignment succeeded. False means there was a
-    /// version mismatch: the language was generated with an incompatible
-    /// version of the Tree-sitter CLI. Check the language's version using
-    /// [`Language::version`] and compare it to this library's
-    /// [`LANGUAGE_VERSION`](LANGUAGE_VERSION) and
-    /// [`MIN_COMPATIBLE_LANGUAGE_VERSION`](MIN_COMPATIBLE_LANGUAGE_VERSION)
-    /// constants.
+    /// assigned. Assignment fails if the language cannot be used for parsing,
+    /// or if it was generated with an incompatible version of the Tree-sitter
+    /// CLI. Check this using [`Language::is_parseable`] and
+    /// [`Language::abi_version`].
     #[doc(alias = "ts_parser_set_language")]
     pub fn set_language(&mut self, language: &Language) -> Result<(), LanguageError> {
-        let version = language.version();
+        let version = language.abi_version();
         if (MIN_COMPATIBLE_LANGUAGE_VERSION..=LANGUAGE_VERSION).contains(&version) {
-            unsafe {
-                ffi::ts_parser_set_language(self.0.as_ptr(), language.0);
+            if !language.is_parseable() {
+                return Err(LanguageError::NotParseable);
+            }
+            #[cfg_attr(
+                not(feature = "wasm"),
+                expect(unused_variables, reason = "only used when wasm feature is enabled")
+            )]
+            let success = unsafe { ffi::ts_parser_set_language(self.0.as_ptr(), language.0) };
+            #[cfg(feature = "wasm")]
+            if !success {
+                return Err(LanguageError::Wasm);
             }
             Ok(())
         } else {
-            Err(LanguageError { version })
+            Err(LanguageError::Version(version))
         }
     }
 
     /// Get the parser's current language.
     #[doc(alias = "ts_parser_language")]
     #[must_use]
-    pub fn language(&self) -> Option<Language> {
+    pub fn language(&self) -> Option<LanguageRef<'_>> {
         let ptr = unsafe { ffi::ts_parser_language(self.0.as_ptr()) };
-        (!ptr.is_null()).then(|| Language(ptr))
+        (!ptr.is_null()).then_some(LanguageRef(ptr, PhantomData))
     }
 
     /// Get the parser's current logger.
@@ -500,16 +812,31 @@ impl Parser {
         unsafe { logger.payload.cast::<Logger>().as_ref() }
     }
 
-    /// Set the logging callback that a parser should use during parsing.
+    /// Set the logging callback that the parser should use during parsing.
+    ///
+    /// To log through a callback that borrows non-`'static` data, see
+    /// [`set_logger_unchecked`](Parser::set_logger_unchecked).
     #[doc(alias = "ts_parser_set_logger")]
     pub fn set_logger(&mut self, logger: Option<Logger>) {
+        // SAFETY: `Logger` is `Send + 'static`
+        unsafe { self.set_logger_unchecked(logger) };
+    }
+
+    /// Set the logging callback, allowing the callback to borrow non-`'static`
+    /// data. See [`set_logger`](Parser::set_logger).
+    ///
+    /// # Safety
+    ///
+    /// Any data borrowed by `logger` must remain valid until the logger is
+    /// removed. Equivalently, the parser must not be used to parse once the
+    /// borrowed data has gone out of scope.
+    pub unsafe fn set_logger_unchecked(&mut self, logger: Option<UnsafeLogger<'_>>) {
         let prev_logger = unsafe { ffi::ts_parser_logger(self.0.as_ptr()) };
         if !prev_logger.payload.is_null() {
             drop(unsafe { Box::from_raw(prev_logger.payload.cast::<Logger>()) });
         }
 
-        let c_logger;
-        if let Some(logger) = logger {
+        let c_logger = if let Some(logger) = logger {
             let container = Box::new(logger);
 
             unsafe extern "C" fn log(
@@ -517,29 +844,31 @@ impl Parser {
                 c_log_type: ffi::TSLogType,
                 c_message: *const c_char,
             ) {
-                let callback = payload.cast::<Logger>().as_mut().unwrap();
-                if let Ok(message) = CStr::from_ptr(c_message).to_str() {
-                    let log_type = if c_log_type == ffi::TSLogTypeParse {
-                        LogType::Parse
-                    } else {
-                        LogType::Lex
-                    };
-                    callback(log_type, message);
+                unsafe {
+                    let callback = payload.cast::<Logger>().as_mut().unwrap();
+                    if let Ok(message) = CStr::from_ptr(c_message).to_str() {
+                        let log_type = if c_log_type == ffi::TSLogTypeParse {
+                            LogType::Parse
+                        } else {
+                            LogType::Lex
+                        };
+                        callback(log_type, message);
+                    }
                 }
             }
 
             let raw_container = Box::into_raw(container);
 
-            c_logger = ffi::TSLogger {
+            ffi::TSLogger {
                 payload: raw_container.cast::<c_void>(),
                 log: Some(log),
-            };
+            }
         } else {
-            c_logger = ffi::TSLogger {
+            ffi::TSLogger {
                 payload: ptr::null_mut(),
                 log: None,
-            };
-        }
+            }
+        };
 
         unsafe { ffi::ts_parser_set_logger(self.0.as_ptr(), c_logger) };
     }
@@ -549,13 +878,15 @@ impl Parser {
     /// want to pipe these graphs directly to a `dot(1)` process in order to
     /// generate SVG output.
     #[doc(alias = "ts_parser_print_dot_graphs")]
+    #[cfg(not(target_os = "wasi"))]
     #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn print_dot_graphs(
         &mut self,
-        #[cfg(any(unix, target_os = "wasi"))] file: &impl AsRawFd,
+        #[cfg(unix)] file: &impl AsRawFd,
         #[cfg(windows)] file: &impl AsRawHandle,
     ) {
-        #[cfg(any(unix, target_os = "wasi"))]
+        #[cfg(unix)]
         {
             let fd = file.as_raw_fd();
             unsafe {
@@ -574,6 +905,9 @@ impl Parser {
 
     /// Stop the parser from printing debugging graphs while parsing.
     #[doc(alias = "ts_parser_print_dot_graphs")]
+    #[cfg(not(target_os = "wasi"))]
+    #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn stop_printing_dot_graphs(&mut self) {
         unsafe { ffi::ts_parser_print_dot_graphs(self.0.as_ptr(), -1) }
     }
@@ -588,39 +922,24 @@ impl Parser {
     ///
     /// Returns a [`Tree`] if parsing succeeded, or `None` if:
     ///  * The parser has not yet had a language assigned with [`Parser::set_language`]
-    ///  * The timeout set with [`Parser::set_timeout_micros`] expired
-    ///  * The cancellation flag set with [`Parser::set_cancellation_flag`] was flipped
     #[doc(alias = "ts_parser_parse")]
     pub fn parse(&mut self, text: impl AsRef<[u8]>, old_tree: Option<&Tree>) -> Option<Tree> {
         let bytes = text.as_ref();
         let len = bytes.len();
-        self.parse_with(
-            &mut |i, _| (i < len).then(|| &bytes[i..]).unwrap_or_default(),
+        self.parse_with_options(
+            &mut |i, _| {
+                if i < len {
+                    &bytes[i..]
+                } else {
+                    Default::default()
+                }
+            },
             old_tree,
+            None,
         )
     }
 
-    /// Parse a slice of UTF16 text.
-    ///
-    /// # Arguments:
-    /// * `text` The UTF16-encoded text to parse.
-    /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
-    ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
-    ///   the new text using [`Tree::edit`].
-    pub fn parse_utf16(
-        &mut self,
-        input: impl AsRef<[u16]>,
-        old_tree: Option<&Tree>,
-    ) -> Option<Tree> {
-        let code_points = input.as_ref();
-        let len = code_points.len();
-        self.parse_utf16_with(
-            &mut |i, _| (i < len).then(|| &code_points[i..]).unwrap_or_default(),
-            old_tree,
-        )
-    }
-
-    /// Parse UTF8 text provided in chunks by a callback.
+    /// Parse text provided in chunks by a callback.
     ///
     /// # Arguments:
     /// * `callback` A function that takes a byte offset and position and returns a slice of
@@ -630,17 +949,29 @@ impl Parser {
     /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
     ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
     ///   the new text using [`Tree::edit`].
-    pub fn parse_with<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
+    /// * `options` Options for parsing the text. This can be used to set a progress callback.
+    pub fn parse_with_options<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
         &mut self,
         callback: &mut F,
         old_tree: Option<&Tree>,
+        options: Option<ParseOptions>,
     ) -> Option<Tree> {
-        // A pointer to this payload is passed on every call to the `read` C function.
-        // The payload contains two things:
-        // 1. A reference to the rust `callback`.
-        // 2. The text that was returned from the previous call to `callback`. This allows the
-        //    callback to return owned values like vectors.
-        let mut payload: (&mut F, Option<T>) = (callback, None);
+        type Payload<'a, F, T> = (&'a mut F, Option<T>);
+
+        // This C function is passed to Tree-sitter as the progress callback.
+        unsafe extern "C" fn progress(state: *mut ffi::TSParseState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<ParseProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&ParseState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
 
         // This C function is passed to Tree-sitter as the input callback.
         unsafe extern "C" fn read<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
@@ -649,27 +980,90 @@ impl Parser {
             position: ffi::TSPoint,
             bytes_read: *mut u32,
         ) -> *const c_char {
-            let (callback, text) = payload.cast::<(&mut F, Option<T>)>().as_mut().unwrap();
-            *text = Some(callback(byte_offset as usize, position.into()));
-            let slice = text.as_ref().unwrap().as_ref();
-            *bytes_read = slice.len() as u32;
-            slice.as_ptr().cast::<c_char>()
+            unsafe {
+                let (callback, text) = payload.cast::<Payload<F, T>>().as_mut().unwrap();
+                *text = Some(callback(byte_offset as usize, position.into()));
+                let slice = text.as_ref().unwrap().as_ref();
+                *bytes_read = slice.len() as u32;
+                slice.as_ptr().cast::<c_char>()
+            }
         }
 
+        let empty_options = ffi::TSParseOptions {
+            payload: ptr::null_mut(),
+            progress_callback: None,
+        };
+
+        let mut callback_ptr;
+        let parse_options = if let Some(options) = options {
+            if let Some(cb) = options.progress_callback {
+                callback_ptr = cb;
+                ffi::TSParseOptions {
+                    payload: core::ptr::addr_of_mut!(callback_ptr).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                }
+            } else {
+                empty_options
+            }
+        } else {
+            empty_options
+        };
+
+        // A pointer to this payload is passed on every call to the `read` C function.
+        // The payload contains two things:
+        // 1. A reference to the rust `callback`.
+        // 2. The text that was returned from the previous call to `callback`. This allows the
+        //    callback to return owned values like vectors.
+        let mut payload: Payload<F, T> = (callback, None);
+
         let c_input = ffi::TSInput {
-            payload: core::ptr::addr_of_mut!(payload).cast::<c_void>(),
+            payload: ptr::addr_of_mut!(payload).cast::<c_void>(),
             read: Some(read::<T, F>),
             encoding: ffi::TSInputEncodingUTF8,
+            decode: None,
         };
 
         let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
         unsafe {
-            let c_new_tree = ffi::ts_parser_parse(self.0.as_ptr(), c_old_tree, c_input);
+            let c_new_tree = ffi::ts_parser_parse_with_options(
+                self.0.as_ptr(),
+                c_old_tree,
+                c_input,
+                parse_options,
+            );
+
             NonNull::new(c_new_tree).map(Tree)
         }
     }
 
-    /// Parse UTF16 text provided in chunks by a callback.
+    /// Parse a slice of UTF16 little-endian text.
+    ///
+    /// # Arguments:
+    /// * `text` The UTF16-encoded text to parse.
+    /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
+    ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
+    ///   the new text using [`Tree::edit`].
+    pub fn parse_utf16_le(
+        &mut self,
+        input: impl AsRef<[u16]>,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        let code_points = input.as_ref();
+        let len = code_points.len();
+        self.parse_utf16_le_with_options(
+            &mut |i, _| {
+                if i < len {
+                    &code_points[i..]
+                } else {
+                    Default::default()
+                }
+            },
+            old_tree,
+            None,
+        )
+    }
+
+    /// Parse UTF16 little-endian text provided in chunks by a callback.
     ///
     /// # Arguments:
     /// * `callback` A function that takes a code point offset and position and returns a slice of
@@ -679,17 +1073,28 @@ impl Parser {
     /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
     ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
     ///   the new text using [`Tree::edit`].
-    pub fn parse_utf16_with<T: AsRef<[u16]>, F: FnMut(usize, Point) -> T>(
+    /// * `options` Options for parsing the text. This can be used to set a progress callback.
+    pub fn parse_utf16_le_with_options<T: AsRef<[u16]>, F: FnMut(usize, Point) -> T>(
         &mut self,
         callback: &mut F,
         old_tree: Option<&Tree>,
+        options: Option<ParseOptions>,
     ) -> Option<Tree> {
-        // A pointer to this payload is passed on every call to the `read` C function.
-        // The payload contains two things:
-        // 1. A reference to the rust `callback`.
-        // 2. The text that was returned from the previous call to `callback`. This allows the
-        //    callback to return owned values like vectors.
-        let mut payload: (&mut F, Option<T>) = (callback, None);
+        type Payload<'a, F, T> = (&'a mut F, Option<T>);
+
+        unsafe extern "C" fn progress(state: *mut ffi::TSParseState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<ParseProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&ParseState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
 
         // This C function is passed to Tree-sitter as the input callback.
         unsafe extern "C" fn read<T: AsRef<[u16]>, F: FnMut(usize, Point) -> T>(
@@ -698,61 +1103,318 @@ impl Parser {
             position: ffi::TSPoint,
             bytes_read: *mut u32,
         ) -> *const c_char {
-            let (callback, text) = payload.cast::<(&mut F, Option<T>)>().as_mut().unwrap();
-            *text = Some(callback(
-                (byte_offset / 2) as usize,
-                Point {
-                    row: position.row as usize,
-                    column: position.column as usize / 2,
-                },
-            ));
-            let slice = text.as_ref().unwrap().as_ref();
-            *bytes_read = slice.len() as u32 * 2;
-            slice.as_ptr().cast::<c_char>()
+            unsafe {
+                let (callback, text) = payload.cast::<Payload<F, T>>().as_mut().unwrap();
+                *text = Some(callback(
+                    (byte_offset / 2) as usize,
+                    Point {
+                        row: position.row as usize,
+                        column: position.column as usize / 2,
+                    },
+                ));
+                let slice = text.as_ref().unwrap().as_ref();
+                *bytes_read = slice.len() as u32 * 2;
+                slice.as_ptr().cast::<c_char>()
+            }
         }
+
+        let empty_options = ffi::TSParseOptions {
+            payload: ptr::null_mut(),
+            progress_callback: None,
+        };
+
+        let mut callback_ptr;
+        let parse_options = if let Some(options) = options {
+            if let Some(cb) = options.progress_callback {
+                callback_ptr = cb;
+                ffi::TSParseOptions {
+                    payload: core::ptr::addr_of_mut!(callback_ptr).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                }
+            } else {
+                empty_options
+            }
+        } else {
+            empty_options
+        };
+
+        // A pointer to this payload is passed on every call to the `read` C function.
+        // The payload contains two things:
+        // 1. A reference to the rust `callback`.
+        // 2. The text that was returned from the previous call to `callback`. This allows the
+        //    callback to return owned values like vectors.
+        let mut payload: Payload<F, T> = (callback, None);
 
         let c_input = ffi::TSInput {
             payload: core::ptr::addr_of_mut!(payload).cast::<c_void>(),
             read: Some(read::<T, F>),
-            encoding: ffi::TSInputEncodingUTF16,
+            encoding: ffi::TSInputEncodingUTF16LE,
+            decode: None,
         };
 
         let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
         unsafe {
-            let c_new_tree = ffi::ts_parser_parse(self.0.as_ptr(), c_old_tree, c_input);
+            let c_new_tree = ffi::ts_parser_parse_with_options(
+                self.0.as_ptr(),
+                c_old_tree,
+                c_input,
+                parse_options,
+            );
+
+            NonNull::new(c_new_tree).map(Tree)
+        }
+    }
+
+    /// Parse a slice of UTF16 big-endian text.
+    ///
+    /// # Arguments:
+    /// * `text` The UTF16-encoded text to parse.
+    /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
+    ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
+    ///   the new text using [`Tree::edit`].
+    pub fn parse_utf16_be(
+        &mut self,
+        input: impl AsRef<[u16]>,
+        old_tree: Option<&Tree>,
+    ) -> Option<Tree> {
+        let code_points = input.as_ref();
+        let len = code_points.len();
+        self.parse_utf16_be_with_options(
+            &mut |i, _| if i < len { &code_points[i..] } else { &[] },
+            old_tree,
+            None,
+        )
+    }
+
+    /// Parse UTF16 big-endian text provided in chunks by a callback.
+    ///
+    /// # Arguments:
+    /// * `callback` A function that takes a code point offset and position and returns a slice of
+    ///   UTF16-encoded text starting at that byte offset and position. The slices can be of any
+    ///   length. If the given position is at the end of the text, the callback should return an
+    ///   empty slice.
+    /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
+    ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
+    ///   the new text using [`Tree::edit`].
+    /// * `options` Options for parsing the text. This can be used to set a progress callback.
+    pub fn parse_utf16_be_with_options<T: AsRef<[u16]>, F: FnMut(usize, Point) -> T>(
+        &mut self,
+        callback: &mut F,
+        old_tree: Option<&Tree>,
+        options: Option<ParseOptions>,
+    ) -> Option<Tree> {
+        type Payload<'a, F, T> = (&'a mut F, Option<T>);
+
+        // This C function is passed to Tree-sitter as the progress callback.
+        unsafe extern "C" fn progress(state: *mut ffi::TSParseState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<ParseProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&ParseState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
+
+        // This C function is passed to Tree-sitter as the input callback.
+        unsafe extern "C" fn read<T: AsRef<[u16]>, F: FnMut(usize, Point) -> T>(
+            payload: *mut c_void,
+            byte_offset: u32,
+            position: ffi::TSPoint,
+            bytes_read: *mut u32,
+        ) -> *const c_char {
+            unsafe {
+                let (callback, text) = payload.cast::<Payload<F, T>>().as_mut().unwrap();
+                *text = Some(callback(
+                    (byte_offset / 2) as usize,
+                    Point {
+                        row: position.row as usize,
+                        column: position.column as usize / 2,
+                    },
+                ));
+                let slice = text.as_ref().unwrap().as_ref();
+                *bytes_read = slice.len() as u32 * 2;
+                slice.as_ptr().cast::<c_char>()
+            }
+        }
+
+        let empty_options = ffi::TSParseOptions {
+            payload: ptr::null_mut(),
+            progress_callback: None,
+        };
+
+        let mut callback_ptr;
+        let parse_options = if let Some(options) = options {
+            if let Some(cb) = options.progress_callback {
+                callback_ptr = cb;
+                ffi::TSParseOptions {
+                    payload: core::ptr::addr_of_mut!(callback_ptr).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                }
+            } else {
+                empty_options
+            }
+        } else {
+            empty_options
+        };
+
+        // A pointer to this payload is passed on every call to the `read` C function.
+        // The payload contains two things:
+        // 1. A reference to the rust `callback`.
+        // 2. The text that was returned from the previous call to `callback`. This allows the
+        //    callback to return owned values like vectors.
+        let mut payload: Payload<F, T> = (callback, None);
+
+        let c_input = ffi::TSInput {
+            payload: core::ptr::addr_of_mut!(payload).cast::<c_void>(),
+            read: Some(read::<T, F>),
+            encoding: ffi::TSInputEncodingUTF16BE,
+            decode: None,
+        };
+
+        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
+        unsafe {
+            let c_new_tree = ffi::ts_parser_parse_with_options(
+                self.0.as_ptr(),
+                c_old_tree,
+                c_input,
+                parse_options,
+            );
+
+            NonNull::new(c_new_tree).map(Tree)
+        }
+    }
+
+    /// Parse text provided in chunks by a callback using a custom encoding.
+    /// This is useful for parsing text in encodings that are not UTF-8 or UTF-16.
+    ///
+    /// # Arguments:
+    /// * `callback` A function that takes a byte offset and position and returns a slice of text
+    ///   starting at that byte offset and position. The slices can be of any length. If the given
+    ///   position is at the end of the text, the callback should return an empty slice.
+    /// * `old_tree` A previous syntax tree parsed from the same document. If the text of the
+    ///   document has changed since `old_tree` was created, then you must edit `old_tree` to match
+    ///   the new text using [`Tree::edit`].
+    /// * `options` Options for parsing the text. This can be used to set a progress callback.
+    ///
+    /// Additionally, you must set the generic parameter [`D`] to a type that implements the
+    /// [`Decode`] trait. This trait has a single method, [`decode`](Decode::decode), which takes a
+    /// slice of bytes and returns a tuple of the code point and the number of bytes consumed.
+    /// The `decode` method should return `-1` for the code point if decoding fails.
+    pub fn parse_custom_encoding<D: Decode, T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
+        &mut self,
+        callback: &mut F,
+        old_tree: Option<&Tree>,
+        options: Option<ParseOptions>,
+    ) -> Option<Tree> {
+        type Payload<'a, F, T> = (&'a mut F, Option<T>);
+
+        unsafe extern "C" fn progress(state: *mut ffi::TSParseState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<ParseProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&ParseState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
+
+        // At compile time, create a C-compatible callback that calls the custom `decode` method.
+        unsafe extern "C" fn decode_fn<D: Decode>(
+            data: *const u8,
+            len: u32,
+            code_point: *mut i32,
+        ) -> u32 {
+            unsafe {
+                let (c, len) = D::decode(core::slice::from_raw_parts(data, len as usize));
+                if let Some(code_point) = code_point.as_mut() {
+                    *code_point = c;
+                }
+                len
+            }
+        }
+
+        // This C function is passed to Tree-sitter as the input callback.
+        unsafe extern "C" fn read<T: AsRef<[u8]>, F: FnMut(usize, Point) -> T>(
+            payload: *mut c_void,
+            byte_offset: u32,
+            position: ffi::TSPoint,
+            bytes_read: *mut u32,
+        ) -> *const c_char {
+            unsafe {
+                let (callback, text) = payload.cast::<Payload<F, T>>().as_mut().unwrap();
+                *text = Some(callback(byte_offset as usize, position.into()));
+                let slice = text.as_ref().unwrap().as_ref();
+                *bytes_read = slice.len() as u32;
+                slice.as_ptr().cast::<c_char>()
+            }
+        }
+
+        let empty_options = ffi::TSParseOptions {
+            payload: ptr::null_mut(),
+            progress_callback: None,
+        };
+
+        let mut callback_ptr;
+        let parse_options = if let Some(options) = options {
+            if let Some(cb) = options.progress_callback {
+                callback_ptr = cb;
+                ffi::TSParseOptions {
+                    payload: core::ptr::addr_of_mut!(callback_ptr).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                }
+            } else {
+                empty_options
+            }
+        } else {
+            empty_options
+        };
+
+        // A pointer to this payload is passed on every call to the `read` C function.
+        // The payload contains two things:
+        // 1. A reference to the rust `callback`.
+        // 2. The text that was returned from the previous call to `callback`. This allows the
+        //    callback to return owned values like vectors.
+        let mut payload: Payload<F, T> = (callback, None);
+
+        let c_input = ffi::TSInput {
+            payload: core::ptr::addr_of_mut!(payload).cast::<c_void>(),
+            read: Some(read::<T, F>),
+            encoding: ffi::TSInputEncodingCustom,
+            // Use this custom decode callback
+            decode: Some(decode_fn::<D>),
+        };
+
+        let c_old_tree = old_tree.map_or(ptr::null_mut(), |t| t.0.as_ptr());
+        unsafe {
+            let c_new_tree = ffi::ts_parser_parse_with_options(
+                self.0.as_ptr(),
+                c_old_tree,
+                c_input,
+                parse_options,
+            );
+
             NonNull::new(c_new_tree).map(Tree)
         }
     }
 
     /// Instruct the parser to start the next parse from the beginning.
     ///
-    /// If the parser previously failed because of a timeout or a cancellation,
-    /// then by default, it will resume where it left off on the next call
-    /// to [`parse`](Parser::parse) or other parsing functions. If you don't
-    /// want to resume, and instead intend to use this parser to parse some
-    /// other document, you must call `reset` first.
+    /// If the parser previously failed because of a callback, then by default,
+    /// it will resume where it left off on the next call to [`parse`](Parser::parse)
+    /// or other parsing functions. If you don't want to resume, and instead intend to use
+    /// this parser to parse some other document, you must call `reset` first.
     #[doc(alias = "ts_parser_reset")]
     pub fn reset(&mut self) {
         unsafe { ffi::ts_parser_reset(self.0.as_ptr()) }
-    }
-
-    /// Get the duration in microseconds that parsing is allowed to take.
-    ///
-    /// This is set via [`set_timeout_micros`](Parser::set_timeout_micros).
-    #[doc(alias = "ts_parser_timeout_micros")]
-    #[must_use]
-    pub fn timeout_micros(&self) -> u64 {
-        unsafe { ffi::ts_parser_timeout_micros(self.0.as_ptr()) }
-    }
-
-    /// Set the maximum duration in microseconds that parsing should be allowed
-    /// to take before halting.
-    ///
-    /// If parsing takes longer than this, it will halt early, returning `None`.
-    /// See [`parse`](Parser::parse) for more information.
-    #[doc(alias = "ts_parser_set_timeout_micros")]
-    pub fn set_timeout_micros(&mut self, timeout_micros: u64) {
-        unsafe { ffi::ts_parser_set_timeout_micros(self.0.as_ptr(), timeout_micros) }
     }
 
     /// Set the ranges of text that the parser should include when parsing.
@@ -806,53 +1468,26 @@ impl Parser {
             let ptr =
                 ffi::ts_parser_included_ranges(self.0.as_ptr(), core::ptr::addr_of_mut!(count));
             let ranges = slice::from_raw_parts(ptr, count as usize);
-            let result = ranges.iter().copied().map(Into::into).collect();
-            result
-        }
-    }
-
-    /// Get the parser's current cancellation flag pointer.
-    ///
-    /// # Safety
-    ///
-    /// It uses FFI
-    #[doc(alias = "ts_parser_cancellation_flag")]
-    #[must_use]
-    pub unsafe fn cancellation_flag(&self) -> Option<&AtomicUsize> {
-        ffi::ts_parser_cancellation_flag(self.0.as_ptr())
-            .cast::<AtomicUsize>()
-            .as_ref()
-    }
-
-    /// Set the parser's current cancellation flag pointer.
-    ///
-    /// If a pointer is assigned, then the parser will periodically read from
-    /// this pointer during parsing. If it reads a non-zero value, it will halt
-    /// early, returning `None`. See [`parse`](Parser::parse) for more
-    /// information.
-    ///
-    /// # Safety
-    ///
-    /// It uses FFI
-    #[doc(alias = "ts_parser_set_cancellation_flag")]
-    pub unsafe fn set_cancellation_flag(&mut self, flag: Option<&AtomicUsize>) {
-        if let Some(flag) = flag {
-            ffi::ts_parser_set_cancellation_flag(
-                self.0.as_ptr(),
-                (flag as *const AtomicUsize).cast::<usize>(),
-            );
-        } else {
-            ffi::ts_parser_set_cancellation_flag(self.0.as_ptr(), ptr::null());
+            ranges.iter().copied().map(Into::into).collect()
         }
     }
 }
 
 impl Drop for Parser {
     fn drop(&mut self) {
-        self.stop_printing_dot_graphs();
+        #[cfg(feature = "std")]
+        #[cfg(not(target_os = "wasi"))]
+        {
+            self.stop_printing_dot_graphs();
+        }
         self.set_logger(None);
         unsafe { ffi::ts_parser_delete(self.0.as_ptr()) }
     }
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _open_osfhandle(osfhandle: isize, flags: core::ffi::c_int) -> core::ffi::c_int;
 }
 
 impl Tree {
@@ -879,6 +1514,11 @@ impl Tree {
     }
 
     /// Get the language that was used to parse the syntax tree.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, this returns the original
+    /// language if the tree is being accessed from the same WebAssembly
+    /// instance that created it. Otherwise, this returns a copy of the language
+    /// that can be used to inspect the tree but cannot be assigned to a parser.
     #[doc(alias = "ts_tree_language")]
     #[must_use]
     pub fn language(&self) -> LanguageRef {
@@ -896,7 +1536,7 @@ impl Tree {
     #[doc(alias = "ts_tree_edit")]
     pub fn edit(&mut self, edit: &InputEdit) {
         let edit = edit.into();
-        unsafe { ffi::ts_tree_edit(self.0.as_ptr(), &edit) };
+        unsafe { ffi::ts_tree_edit(self.0.as_ptr(), &raw const edit) };
     }
 
     /// Create a new [`TreeCursor`] starting from the root of the tree.
@@ -915,7 +1555,6 @@ impl Tree {
     /// functions. Call it on the old tree that was passed to parse, and
     /// pass the new tree that was returned from `parse`.
     #[doc(alias = "ts_tree_get_changed_ranges")]
-    #[must_use]
     pub fn changed_ranges(&self, other: &Self) -> impl ExactSizeIterator<Item = Range> {
         let mut count = 0u32;
         unsafe {
@@ -937,7 +1576,7 @@ impl Tree {
             let ptr = ffi::ts_tree_included_ranges(self.0.as_ptr(), core::ptr::addr_of_mut!(count));
             let ranges = slice::from_raw_parts(ptr, count as usize);
             let result = ranges.iter().copied().map(Into::into).collect();
-            (FREE_FN)(ptr.cast::<c_void>());
+            ts_free(ptr.cast::<c_void>());
             result
         }
     }
@@ -947,13 +1586,15 @@ impl Tree {
     /// graph directly to a `dot(1)` process in order to generate SVG
     /// output.
     #[doc(alias = "ts_tree_print_dot_graph")]
+    #[cfg(not(target_os = "wasi"))]
     #[cfg(feature = "std")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn print_dot_graph(
         &self,
-        #[cfg(any(unix, target_os = "wasi"))] file: &impl AsRawFd,
+        #[cfg(unix)] file: &impl AsRawFd,
         #[cfg(windows)] file: &impl AsRawHandle,
     ) {
-        #[cfg(any(unix, target_os = "wasi"))]
+        #[cfg(unix)]
         {
             let fd = file.as_raw_fd();
             unsafe { ffi::ts_tree_print_dot_graph(self.0.as_ptr(), fd) }
@@ -962,7 +1603,8 @@ impl Tree {
         #[cfg(windows)]
         {
             let handle = file.as_raw_handle();
-            unsafe { ffi::ts_tree_print_dot_graph(self.0.as_ptr(), handle as i32) }
+            let fd = unsafe { _open_osfhandle(handle as isize, 0) };
+            unsafe { ffi::ts_tree_print_dot_graph(self.0.as_ptr(), fd) }
         }
     }
 }
@@ -992,10 +1634,14 @@ impl<'tree> Node<'tree> {
 
     /// Get a numeric id for this node that is unique.
     ///
-    /// Within a given syntax tree, no two nodes have the same id. However, if
-    /// a new tree is created based on an older tree, and a node from the old
-    /// tree is reused in the process, then that node will have the same id in
-    /// both trees.
+    /// Within a given syntax tree, no two nodes have the same id. However:
+    ///
+    /// - If a new tree is created based on an older tree, and a node from the old tree is reused in
+    ///   the process, then that node will have the same id in both trees.
+    ///
+    /// - A node not marked as having changes does not guarantee it was reused.
+    ///
+    /// - If a node is marked as having changed in the old tree, it will not be reused.
     #[must_use]
     pub fn id(&self) -> usize {
         self.0.id as usize
@@ -1019,26 +1665,32 @@ impl<'tree> Node<'tree> {
     /// Get this node's type as a string.
     #[doc(alias = "ts_node_type")]
     #[must_use]
-    pub fn kind(&self) -> &'static str {
-        unsafe { CStr::from_ptr(ffi::ts_node_type(self.0)) }
-            .to_str()
-            .unwrap()
+    pub fn kind(&self) -> &'tree str {
+        let ptr = unsafe { ffi::ts_node_type(self.0) };
+        assert!(!ptr.is_null());
+        unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()
     }
 
     /// Get this node's symbol name as it appears in the grammar ignoring
     /// aliases as a string.
     #[doc(alias = "ts_node_grammar_type")]
     #[must_use]
-    pub fn grammar_name(&self) -> &'static str {
-        unsafe { CStr::from_ptr(ffi::ts_node_grammar_type(self.0)) }
-            .to_str()
-            .unwrap()
+    pub fn grammar_name(&self) -> &'tree str {
+        let ptr = unsafe { ffi::ts_node_grammar_type(self.0) };
+        assert!(!ptr.is_null());
+        unsafe { CStr::from_ptr(ptr) }.to_str().unwrap()
     }
 
     /// Get the [`Language`] that was used to parse this node's syntax tree.
+    ///
+    /// When Tree-sitter is compiled to WebAssembly, this returns the original
+    /// language if the node is being accessed from the same WebAssembly
+    /// instance that created its tree. Otherwise, this returns a copy of the
+    /// language that can be used to inspect the tree but cannot be assigned to
+    /// a parser.
     #[doc(alias = "ts_node_language")]
     #[must_use]
-    pub fn language(&self) -> LanguageRef {
+    pub fn language(&self) -> LanguageRef<'tree> {
         LanguageRef(unsafe { ffi::ts_node_language(self.0) }, PhantomData)
     }
 
@@ -1054,7 +1706,7 @@ impl<'tree> Node<'tree> {
 
     /// Check if this node is *extra*.
     ///
-    /// Extra nodes represent things like comments, which are not required the
+    /// Extra nodes represent things like comments, which are not required by the
     /// grammar, but can appear anywhere.
     #[doc(alias = "ts_node_is_extra")]
     #[must_use]
@@ -1087,7 +1739,14 @@ impl<'tree> Node<'tree> {
         unsafe { ffi::ts_node_is_error(self.0) }
     }
 
-    /// Get this node's parse state.
+    /// Get the parse state immediately before this node.
+    ///
+    /// For a missing node, this is the state from the recovery path that was
+    /// selected by the parser. It can be used with
+    /// [`Language::lookahead_iterator`] to inspect the symbols that are valid in
+    /// that state. This does not necessarily include every symbol that could be
+    /// recovered by inserting a missing node, because the recovery process can
+    /// consider multiple stack versions.
     #[doc(alias = "ts_node_parse_state")]
     #[must_use]
     pub fn parse_state(&self) -> u16 {
@@ -1111,14 +1770,14 @@ impl<'tree> Node<'tree> {
         unsafe { ffi::ts_node_is_missing(self.0) }
     }
 
-    /// Get the byte offsets where this node starts.
+    /// Get the byte offset where this node starts.
     #[doc(alias = "ts_node_start_byte")]
     #[must_use]
     pub fn start_byte(&self) -> usize {
         unsafe { ffi::ts_node_start_byte(self.0) as usize }
     }
 
-    /// Get the byte offsets where this node end.
+    /// Get the byte offset where this node ends.
     #[doc(alias = "ts_node_end_byte")]
     #[must_use]
     pub fn end_byte(&self) -> usize {
@@ -1167,15 +1826,15 @@ impl<'tree> Node<'tree> {
     /// [`Node::children`] instead.
     #[doc(alias = "ts_node_child")]
     #[must_use]
-    pub fn child(&self, i: usize) -> Option<Self> {
-        Self::new(unsafe { ffi::ts_node_child(self.0, i as u32) })
+    pub fn child(&self, i: u32) -> Option<Self> {
+        Self::new(unsafe { ffi::ts_node_child(self.0, i) })
     }
 
     /// Get this node's number of children.
     #[doc(alias = "ts_node_child_count")]
     #[must_use]
-    pub fn child_count(&self) -> usize {
-        unsafe { ffi::ts_node_child_count(self.0) as usize }
+    pub fn child_count(&self) -> u32 {
+        unsafe { ffi::ts_node_child_count(self.0) }
     }
 
     /// Get this node's *named* child at the given index.
@@ -1186,8 +1845,8 @@ impl<'tree> Node<'tree> {
     /// [`Node::named_children`] instead.
     #[doc(alias = "ts_node_named_child")]
     #[must_use]
-    pub fn named_child(&self, i: usize) -> Option<Self> {
-        Self::new(unsafe { ffi::ts_node_named_child(self.0, i as u32) })
+    pub fn named_child(&self, i: u32) -> Option<Self> {
+        Self::new(unsafe { ffi::ts_node_named_child(self.0, i) })
     }
 
     /// Get this node's number of *named* children.
@@ -1229,7 +1888,7 @@ impl<'tree> Node<'tree> {
     /// Get the field name of this node's child at the given index.
     #[doc(alias = "ts_node_field_name_for_child")]
     #[must_use]
-    pub fn field_name_for_child(&self, child_index: u32) -> Option<&'static str> {
+    pub fn field_name_for_child(&self, child_index: u32) -> Option<&'tree str> {
         unsafe {
             let ptr = ffi::ts_node_field_name_for_child(self.0, child_index);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
@@ -1237,7 +1896,8 @@ impl<'tree> Node<'tree> {
     }
 
     /// Get the field name of this node's named child at the given index.
-    pub fn field_name_for_named_child(&self, named_child_index: u32) -> Option<&'static str> {
+    #[must_use]
+    pub fn field_name_for_named_child(&self, named_child_index: u32) -> Option<&'tree str> {
         unsafe {
             let ptr = ffi::ts_node_field_name_for_named_child(self.0, named_child_index);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
@@ -1347,7 +2007,7 @@ impl<'tree> Node<'tree> {
     }
 
     /// Get this node's immediate parent.
-    /// Prefer [`child_containing_descendant`](Node::child_containing_descendant)
+    /// Prefer [`child_with_descendant`](Node::child_with_descendant)
     /// for iterating over this node's ancestors.
     #[doc(alias = "ts_node_parent")]
     #[must_use]
@@ -1355,11 +2015,13 @@ impl<'tree> Node<'tree> {
         Self::new(unsafe { ffi::ts_node_parent(self.0) })
     }
 
-    /// Get this node's child that contains `descendant`.
-    #[doc(alias = "ts_node_child_containing_descendant")]
+    /// Get the node that contains `descendant`.
+    ///
+    /// Note that this can return `descendant` itself.
+    #[doc(alias = "ts_node_child_with_descendant")]
     #[must_use]
-    pub fn child_containing_descendant(&self, descendant: Self) -> Option<Self> {
-        Self::new(unsafe { ffi::ts_node_child_containing_descendant(self.0, descendant.0) })
+    pub fn child_with_descendant(&self, descendant: Self) -> Option<Self> {
+        Self::new(unsafe { ffi::ts_node_child_with_descendant(self.0, descendant.0) })
     }
 
     /// Get this node's next sibling.
@@ -1390,14 +2052,14 @@ impl<'tree> Node<'tree> {
         Self::new(unsafe { ffi::ts_node_prev_named_sibling(self.0) })
     }
 
-    /// Get the node's first child that extends beyond the given byte offset.
+    /// Get this node's first child that contains or starts after the given byte offset.
     #[doc(alias = "ts_node_first_child_for_byte")]
     #[must_use]
     pub fn first_child_for_byte(&self, byte: usize) -> Option<Self> {
         Self::new(unsafe { ffi::ts_node_first_child_for_byte(self.0, byte as u32) })
     }
 
-    /// Get the node's first named child that extends beyond the given byte offset.
+    /// Get this node's first named child that contains or starts after the given byte offset.
     #[doc(alias = "ts_node_first_named_child_for_point")]
     #[must_use]
     pub fn first_named_child_for_byte(&self, byte: usize) -> Option<Self> {
@@ -1411,7 +2073,7 @@ impl<'tree> Node<'tree> {
         unsafe { ffi::ts_node_descendant_count(self.0) as usize }
     }
 
-    /// Get the smallest node within this node that spans the given range.
+    /// Get the smallest node within this node that spans the given byte range.
     #[doc(alias = "ts_node_descendant_for_byte_range")]
     #[must_use]
     pub fn descendant_for_byte_range(&self, start: usize, end: usize) -> Option<Self> {
@@ -1420,7 +2082,7 @@ impl<'tree> Node<'tree> {
         })
     }
 
-    /// Get the smallest named node within this node that spans the given range.
+    /// Get the smallest named node within this node that spans the given byte range.
     #[doc(alias = "ts_node_named_descendant_for_byte_range")]
     #[must_use]
     pub fn named_descendant_for_byte_range(&self, start: usize, end: usize) -> Option<Self> {
@@ -1429,7 +2091,7 @@ impl<'tree> Node<'tree> {
         })
     }
 
-    /// Get the smallest node within this node that spans the given range.
+    /// Get the smallest node within this node that spans the given point range.
     #[doc(alias = "ts_node_descendant_for_point_range")]
     #[must_use]
     pub fn descendant_for_point_range(&self, start: Point, end: Point) -> Option<Self> {
@@ -1438,7 +2100,7 @@ impl<'tree> Node<'tree> {
         })
     }
 
-    /// Get the smallest named node within this node that spans the given range.
+    /// Get the smallest named node within this node that spans the given point range.
     #[doc(alias = "ts_node_named_descendant_for_point_range")]
     #[must_use]
     pub fn named_descendant_for_point_range(&self, start: Point, end: Point) -> Option<Self> {
@@ -1447,6 +2109,7 @@ impl<'tree> Node<'tree> {
         })
     }
 
+    /// Get an S-expression representing the node.
     #[doc(alias = "ts_node_string")]
     #[must_use]
     pub fn to_sexp(&self) -> String {
@@ -1455,7 +2118,7 @@ impl<'tree> Node<'tree> {
             .to_str()
             .unwrap()
             .to_string();
-        unsafe { (FREE_FN)(c_string.cast::<c_void>()) };
+        unsafe { ts_free(c_string.cast::<c_void>()) };
         result
     }
 
@@ -1465,10 +2128,13 @@ impl<'tree> Node<'tree> {
 
     #[must_use]
     pub fn utf16_text<'a>(&self, source: &'a [u16]) -> &'a [u16] {
-        &source[self.start_byte()..self.end_byte()]
+        &source[self.start_byte() / 2..self.end_byte() / 2]
     }
 
     /// Create a new [`TreeCursor`] starting from this node.
+    ///
+    /// Note that the given node is considered the root of the cursor,
+    /// and the cursor cannot walk outside this node.
     #[doc(alias = "ts_tree_cursor_new")]
     #[must_use]
     pub fn walk(&self) -> TreeCursor<'tree> {
@@ -1485,13 +2151,13 @@ impl<'tree> Node<'tree> {
     #[doc(alias = "ts_node_edit")]
     pub fn edit(&mut self, edit: &InputEdit) {
         let edit = edit.into();
-        unsafe { ffi::ts_node_edit(core::ptr::addr_of_mut!(self.0), &edit) }
+        unsafe { ffi::ts_node_edit(core::ptr::addr_of_mut!(self.0), &raw const edit) }
     }
 }
 
 impl PartialEq for Node<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.0.id == other.0.id
+        core::ptr::eq(self.0.id, other.0.id)
     }
 }
 
@@ -1532,13 +2198,13 @@ impl fmt::Display for Node<'_> {
     }
 }
 
-impl<'cursor> TreeCursor<'cursor> {
+impl<'tree> TreeCursor<'tree> {
     /// Get the tree cursor's current [`Node`].
     #[doc(alias = "ts_tree_cursor_current_node")]
     #[must_use]
-    pub fn node(&self) -> Node<'cursor> {
+    pub fn node(&self) -> Node<'tree> {
         Node(
-            unsafe { ffi::ts_tree_cursor_current_node(&self.0) },
+            unsafe { ffi::ts_tree_cursor_current_node(&raw const self.0) },
             PhantomData,
         )
     }
@@ -1549,16 +2215,16 @@ impl<'cursor> TreeCursor<'cursor> {
     #[doc(alias = "ts_tree_cursor_current_field_id")]
     #[must_use]
     pub fn field_id(&self) -> Option<FieldId> {
-        let id = unsafe { ffi::ts_tree_cursor_current_field_id(&self.0) };
+        let id = unsafe { ffi::ts_tree_cursor_current_field_id(&raw const self.0) };
         FieldId::new(id)
     }
 
     /// Get the field name of this tree cursor's current node.
     #[doc(alias = "ts_tree_cursor_current_field_name")]
     #[must_use]
-    pub fn field_name(&self) -> Option<&'static str> {
+    pub fn field_name(&self) -> Option<&'tree str> {
         unsafe {
-            let ptr = ffi::ts_tree_cursor_current_field_name(&self.0);
+            let ptr = ffi::ts_tree_cursor_current_field_name(&raw const self.0);
             (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_str().unwrap())
         }
     }
@@ -1568,7 +2234,7 @@ impl<'cursor> TreeCursor<'cursor> {
     #[doc(alias = "ts_tree_cursor_current_depth")]
     #[must_use]
     pub fn depth(&self) -> u32 {
-        unsafe { ffi::ts_tree_cursor_current_depth(&self.0) }
+        unsafe { ffi::ts_tree_cursor_current_depth(&raw const self.0) }
     }
 
     /// Get the index of the cursor's current node out of all of the
@@ -1576,7 +2242,7 @@ impl<'cursor> TreeCursor<'cursor> {
     #[doc(alias = "ts_tree_cursor_current_descendant_index")]
     #[must_use]
     pub fn descendant_index(&self) -> usize {
-        unsafe { ffi::ts_tree_cursor_current_descendant_index(&self.0) as usize }
+        unsafe { ffi::ts_tree_cursor_current_descendant_index(&raw const self.0) as usize }
     }
 
     /// Move this cursor to the first child of its current node.
@@ -1585,7 +2251,7 @@ impl<'cursor> TreeCursor<'cursor> {
     /// `false` if there were no children.
     #[doc(alias = "ts_tree_cursor_goto_first_child")]
     pub fn goto_first_child(&mut self) -> bool {
-        unsafe { ffi::ts_tree_cursor_goto_first_child(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_goto_first_child(&raw mut self.0) }
     }
 
     /// Move this cursor to the last child of its current node.
@@ -1598,7 +2264,7 @@ impl<'cursor> TreeCursor<'cursor> {
     /// iterate through all the children to compute the child's position.
     #[doc(alias = "ts_tree_cursor_goto_last_child")]
     pub fn goto_last_child(&mut self) -> bool {
-        unsafe { ffi::ts_tree_cursor_goto_last_child(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_goto_last_child(&raw mut self.0) }
     }
 
     /// Move this cursor to the parent of its current node.
@@ -1606,18 +2272,24 @@ impl<'cursor> TreeCursor<'cursor> {
     /// This returns `true` if the cursor successfully moved, and returns
     /// `false` if there was no parent node (the cursor was already on the
     /// root node).
+    ///
+    /// Note that the node the cursor was constructed with is considered the root
+    /// of the cursor, and the cursor cannot walk outside this node.
     #[doc(alias = "ts_tree_cursor_goto_parent")]
     pub fn goto_parent(&mut self) -> bool {
-        unsafe { ffi::ts_tree_cursor_goto_parent(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_goto_parent(&raw mut self.0) }
     }
 
     /// Move this cursor to the next sibling of its current node.
     ///
     /// This returns `true` if the cursor successfully moved, and returns
     /// `false` if there was no next sibling node.
+    ///
+    /// Note that the node the cursor was constructed with is considered the root
+    /// of the cursor, and the cursor cannot walk outside this node.
     #[doc(alias = "ts_tree_cursor_goto_next_sibling")]
     pub fn goto_next_sibling(&mut self) -> bool {
-        unsafe { ffi::ts_tree_cursor_goto_next_sibling(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_goto_next_sibling(&raw mut self.0) }
     }
 
     /// Move the cursor to the node that is the nth descendant of
@@ -1625,7 +2297,7 @@ impl<'cursor> TreeCursor<'cursor> {
     /// zero represents the original node itself.
     #[doc(alias = "ts_tree_cursor_goto_descendant")]
     pub fn goto_descendant(&mut self, descendant_index: usize) {
-        unsafe { ffi::ts_tree_cursor_goto_descendant(&mut self.0, descendant_index as u32) }
+        unsafe { ffi::ts_tree_cursor_goto_descendant(&raw mut self.0, descendant_index as u32) }
     }
 
     /// Move this cursor to the previous sibling of its current node.
@@ -1636,42 +2308,44 @@ impl<'cursor> TreeCursor<'cursor> {
     /// Note, that this function may be slower than
     /// [`goto_next_sibling`](TreeCursor::goto_next_sibling) due to how node
     /// positions are stored. In the worst case, this will need to iterate
-    /// through all the children upto the previous sibling node to recalculate
-    /// its position.
+    /// through all the children up to the previous sibling node to recalculate
+    /// its position. Also note that the node the cursor was constructed with is
+    /// considered the root of the cursor, and the cursor cannot walk outside this node.
     #[doc(alias = "ts_tree_cursor_goto_previous_sibling")]
     pub fn goto_previous_sibling(&mut self) -> bool {
-        unsafe { ffi::ts_tree_cursor_goto_previous_sibling(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_goto_previous_sibling(&raw mut self.0) }
     }
 
-    /// Move this cursor to the first child of its current node that extends
-    /// beyond the given byte offset.
+    /// Move this cursor to the first child of its current node that contains or
+    /// starts after the given byte offset.
     ///
     /// This returns the index of the child node if one was found, and returns
     /// `None` if no such child was found.
     #[doc(alias = "ts_tree_cursor_goto_first_child_for_byte")]
     pub fn goto_first_child_for_byte(&mut self, index: usize) -> Option<usize> {
         let result =
-            unsafe { ffi::ts_tree_cursor_goto_first_child_for_byte(&mut self.0, index as u32) };
-        (result >= 0).then_some(result as usize)
+            unsafe { ffi::ts_tree_cursor_goto_first_child_for_byte(&raw mut self.0, index as u32) };
+        result.try_into().ok()
     }
 
-    /// Move this cursor to the first child of its current node that extends
-    /// beyond the given byte offset.
+    /// Move this cursor to the first child of its current node that contains or
+    /// starts after the given byte offset.
     ///
     /// This returns the index of the child node if one was found, and returns
     /// `None` if no such child was found.
     #[doc(alias = "ts_tree_cursor_goto_first_child_for_point")]
     pub fn goto_first_child_for_point(&mut self, point: Point) -> Option<usize> {
-        let result =
-            unsafe { ffi::ts_tree_cursor_goto_first_child_for_point(&mut self.0, point.into()) };
-        (result >= 0).then_some(result as usize)
+        let result = unsafe {
+            ffi::ts_tree_cursor_goto_first_child_for_point(&raw mut self.0, point.into())
+        };
+        result.try_into().ok()
     }
 
     /// Re-initialize this tree cursor to start at the original node that the
     /// cursor was constructed with.
     #[doc(alias = "ts_tree_cursor_reset")]
-    pub fn reset(&mut self, node: Node<'cursor>) {
-        unsafe { ffi::ts_tree_cursor_reset(&mut self.0, node.0) };
+    pub fn reset(&mut self, node: Node<'tree>) {
+        unsafe { ffi::ts_tree_cursor_reset(&raw mut self.0, node.0) };
     }
 
     /// Re-initialize a tree cursor to the same position as another cursor.
@@ -1680,19 +2354,22 @@ impl<'cursor> TreeCursor<'cursor> {
     /// information and allows reusing already created cursors.
     #[doc(alias = "ts_tree_cursor_reset_to")]
     pub fn reset_to(&mut self, cursor: &Self) {
-        unsafe { ffi::ts_tree_cursor_reset_to(&mut self.0, &cursor.0) };
+        unsafe { ffi::ts_tree_cursor_reset_to(&raw mut self.0, &raw const cursor.0) };
     }
 }
 
 impl Clone for TreeCursor<'_> {
     fn clone(&self) -> Self {
-        TreeCursor(unsafe { ffi::ts_tree_cursor_copy(&self.0) }, PhantomData)
+        TreeCursor(
+            unsafe { ffi::ts_tree_cursor_copy(&raw const self.0) },
+            PhantomData,
+        )
     }
 }
 
 impl Drop for TreeCursor<'_> {
     fn drop(&mut self) {
-        unsafe { ffi::ts_tree_cursor_delete(&mut self.0) }
+        unsafe { ffi::ts_tree_cursor_delete(&raw mut self.0) }
     }
 }
 
@@ -1708,22 +2385,34 @@ impl LookaheadIterator {
     }
 
     /// Get the current symbol of the lookahead iterator.
+    ///
+    /// Returns `None` if the iterator is not positioned on a symbol:
+    ///
+    /// - Before the first [`Iterator::next`] call
+    /// - After the iterator is exhausted
+    /// - After a [`Self::reset`] or [`Self::reset_state`] call
     #[doc(alias = "ts_lookahead_iterator_current_symbol")]
     #[must_use]
-    pub fn current_symbol(&self) -> u16 {
-        unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) }
+    pub fn current_symbol(&self) -> Option<u16> {
+        // C signals "not positioned" through a null symbol name.
+        let name = unsafe { ffi::ts_lookahead_iterator_current_symbol_name(self.0.as_ptr()) };
+        (!name.is_null())
+            .then(|| unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) })
     }
 
     /// Get the current symbol name of the lookahead iterator.
+    ///
+    /// Returns `None` if the iterator is not positioned on a symbol.
     #[doc(alias = "ts_lookahead_iterator_current_symbol_name")]
     #[must_use]
-    pub fn current_symbol_name(&self) -> &'static str {
+    pub fn current_symbol_name(&self) -> Option<&str> {
         unsafe {
-            CStr::from_ptr(ffi::ts_lookahead_iterator_current_symbol_name(
-                self.0.as_ptr(),
-            ))
-            .to_str()
-            .unwrap()
+            let name = ffi::ts_lookahead_iterator_current_symbol_name(self.0.as_ptr());
+            if name.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(name).to_str().unwrap())
+            }
         }
     }
 
@@ -1746,30 +2435,43 @@ impl LookaheadIterator {
     }
 
     /// Iterate symbol names.
-    pub fn iter_names(&mut self) -> impl Iterator<Item = &'static str> + '_ {
+    pub fn iter_names(&mut self) -> impl iter::FusedIterator<Item = &str> + '_ {
         LookaheadNamesIterator(self)
     }
 }
 
-impl Iterator for LookaheadNamesIterator<'_> {
-    type Item = &'static str;
+impl<'a> Iterator for LookaheadNamesIterator<'a> {
+    type Item = &'a str;
 
     #[doc(alias = "ts_lookahead_iterator_next")]
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe { ffi::ts_lookahead_iterator_next(self.0 .0.as_ptr()) }
-            .then(|| self.0.current_symbol_name())
+        let ptr = self.0.0.as_ptr();
+        // SAFETY: The borrow keeps the iterator (and the language refcount it holds)
+        // alive for `'a`. The name is non-null because the iterator is positioned
+        // whenever `next` returns `true`.
+        unsafe {
+            ffi::ts_lookahead_iterator_next(ptr).then(|| {
+                let name = ffi::ts_lookahead_iterator_current_symbol_name(ptr);
+                debug_assert!(!name.is_null());
+                CStr::from_ptr(name).to_str().unwrap()
+            })
+        }
     }
 }
+
+impl iter::FusedIterator for LookaheadNamesIterator<'_> {}
 
 impl Iterator for LookaheadIterator {
     type Item = u16;
 
     #[doc(alias = "ts_lookahead_iterator_next")]
     fn next(&mut self) -> Option<Self::Item> {
-        // the first symbol is always `0` so we can safely skip it
-        unsafe { ffi::ts_lookahead_iterator_next(self.0.as_ptr()) }.then(|| self.current_symbol())
+        unsafe { ffi::ts_lookahead_iterator_next(self.0.as_ptr()) }
+            .then(|| unsafe { ffi::ts_lookahead_iterator_current_symbol(self.0.as_ptr()) })
     }
 }
+
+impl iter::FusedIterator for LookaheadIterator {}
 
 impl Drop for LookaheadIterator {
     #[doc(alias = "ts_lookahead_iterator_delete")]
@@ -1786,6 +2488,16 @@ impl Query {
     /// on syntax nodes parsed with that language. References to Queries can be
     /// shared between multiple threads.
     pub fn new(language: &Language, source: &str) -> Result<Self, QueryError> {
+        let ptr = Self::new_raw(language, source)?;
+        unsafe { Self::from_raw_parts(ptr, source) }
+    }
+
+    /// Constructs a raw [`TSQuery`](ffi::TSQuery) pointer without performing extra checks specific to the rust
+    /// bindings, such as predicate validation. A [`Query`] object can be constructed from the
+    /// returned pointer using [`from_raw_parts`](Query::from_raw_parts). The caller is
+    /// responsible for ensuring that the returned pointer is eventually freed by calling
+    /// [`ts_query_delete`](ffi::ts_query_delete).
+    pub fn new_raw(language: &Language, source: &str) -> Result<*mut ffi::TSQuery, QueryError> {
         let mut error_offset = 0u32;
         let mut error_type: ffi::TSQueryError = 0;
         let bytes = source.as_bytes();
@@ -1801,77 +2513,90 @@ impl Query {
             )
         };
 
+        if !ptr.is_null() {
+            return Ok(ptr);
+        }
+
         // On failure, build an error based on the error code and offset.
-        if ptr.is_null() {
-            if error_type == ffi::TSQueryErrorLanguage {
-                return Err(QueryError {
-                    row: 0,
-                    column: 0,
-                    offset: 0,
-                    message: LanguageError {
-                        version: language.version(),
-                    }
-                    .to_string(),
-                    kind: QueryErrorKind::Language,
-                });
-            }
+        if error_type == ffi::TSQueryErrorLanguage {
+            return Err(QueryError {
+                row: 0,
+                column: 0,
+                offset: 0,
+                message: LanguageError::Version(language.abi_version()).to_string(),
+                kind: QueryErrorKind::Language,
+            });
+        }
 
-            let offset = error_offset as usize;
-            let mut line_start = 0;
-            let mut row = 0;
-            let mut line_containing_error = None;
-            for line in source.lines() {
-                let line_end = line_start + line.len() + 1;
-                if line_end > offset {
-                    line_containing_error = Some(line);
-                    break;
-                }
-                line_start = line_end;
-                row += 1;
+        let offset = error_offset as usize;
+        let mut line_start = 0;
+        let mut row = 0;
+        let mut line_containing_error = None;
+        for line in source.lines() {
+            let line_end = line_start + line.len() + 1;
+            if line_end > offset {
+                line_containing_error = Some(line);
+                break;
             }
-            let column = offset - line_start;
+            line_start = line_end;
+            row += 1;
+        }
+        let column = offset - line_start;
 
-            let kind;
-            let message;
-            match error_type {
-                // Error types that report names
-                ffi::TSQueryErrorNodeType | ffi::TSQueryErrorField | ffi::TSQueryErrorCapture => {
-                    let suffix = source.split_at(offset).1;
-                    let end_offset = suffix
-                        .find(|c| !char::is_alphanumeric(c) && c != '_' && c != '-')
-                        .unwrap_or(suffix.len());
-                    message = suffix.split_at(end_offset).0.to_string();
-                    kind = match error_type {
+        let (message, kind) = match error_type {
+            // Error types that report names
+            ffi::TSQueryErrorNodeType | ffi::TSQueryErrorField | ffi::TSQueryErrorCapture => {
+                let suffix = source.split_at(offset).1;
+                let in_quotes = offset > 0 && source.as_bytes()[offset - 1] == b'"';
+                let mut backslashes = 0;
+                let end_offset = suffix
+                    .find(|c| {
+                        if in_quotes {
+                            if c == '"' && backslashes % 2 == 0 {
+                                true
+                            } else if c == '\\' {
+                                backslashes += 1;
+                                false
+                            } else {
+                                backslashes = 0;
+                                false
+                            }
+                        } else {
+                            !char::is_alphanumeric(c) && c != '_' && c != '-'
+                        }
+                    })
+                    .unwrap_or(suffix.len());
+                (
+                    format!("\"{}\"", suffix.split_at(end_offset).0),
+                    match error_type {
                         ffi::TSQueryErrorNodeType => QueryErrorKind::NodeType,
                         ffi::TSQueryErrorField => QueryErrorKind::Field,
                         ffi::TSQueryErrorCapture => QueryErrorKind::Capture,
                         _ => unreachable!(),
-                    };
-                }
+                    },
+                )
+            }
 
-                // Error types that report positions
-                _ => {
-                    message = line_containing_error.map_or_else(
-                        || "Unexpected EOF".to_string(),
-                        |line| line.to_string() + "\n" + &" ".repeat(offset - line_start) + "^",
-                    );
-                    kind = match error_type {
-                        ffi::TSQueryErrorStructure => QueryErrorKind::Structure,
-                        _ => QueryErrorKind::Syntax,
-                    };
-                }
-            };
+            // Error types that report positions
+            _ => (
+                line_containing_error.map_or_else(
+                    || "Unexpected EOF".to_string(),
+                    |line| line.to_string() + "\n" + &" ".repeat(offset - line_start) + "^",
+                ),
+                match error_type {
+                    ffi::TSQueryErrorStructure => QueryErrorKind::Structure,
+                    _ => QueryErrorKind::Syntax,
+                },
+            ),
+        };
 
-            return Err(QueryError {
-                row,
-                column,
-                offset,
-                message,
-                kind,
-            });
-        }
-
-        unsafe { Self::from_raw_parts(ptr, source) }
+        Err(QueryError {
+            row,
+            column,
+            offset,
+            message,
+            kind,
+        })
     }
 
     #[doc(hidden)]
@@ -1891,7 +2616,7 @@ impl Query {
         let pattern_count = unsafe { ffi::ts_query_pattern_count(ptr.0) as usize };
 
         let mut capture_names = Vec::with_capacity(capture_count as usize);
-        let mut capture_quantifiers_vec = Vec::with_capacity(pattern_count as usize);
+        let mut capture_quantifiers_vec = Vec::with_capacity(pattern_count);
         let mut text_predicates_vec = Vec::with_capacity(pattern_count);
         let mut property_predicates_vec = Vec::with_capacity(pattern_count);
         let mut property_settings_vec = Vec::with_capacity(pattern_count);
@@ -1910,7 +2635,7 @@ impl Query {
             }
         }
 
-        // Build a vector to store capture qunatifiers.
+        // Build a vector to store capture quantifiers.
         for i in 0..pattern_count {
             let mut capture_quantifiers = Vec::with_capacity(capture_count as usize);
             for j in 0..capture_count {
@@ -1930,8 +2655,7 @@ impl Query {
                     ffi::ts_query_string_value_for_id(ptr.0, i, core::ptr::addr_of_mut!(length))
                         .cast::<u8>();
                 let value = slice::from_raw_parts(value, length as usize);
-                let value = str::from_utf8_unchecked(value);
-                value
+                str::from_utf8_unchecked(value)
             })
             .collect::<Vec<_>>();
 
@@ -1944,9 +2668,11 @@ impl Query {
                     i as u32,
                     core::ptr::addr_of_mut!(length),
                 );
-                (length > 0)
-                    .then(|| slice::from_raw_parts(raw_predicates, length as usize))
-                    .unwrap_or_default()
+                if length > 0 {
+                    slice::from_raw_parts(raw_predicates, length as usize)
+                } else {
+                    Default::default()
+                }
             };
 
             let byte_offset = unsafe { ffi::ts_query_start_byte_for_pattern(ptr.0, i as u32) };
@@ -1988,16 +2714,19 @@ impl Query {
                             return Err(predicate_error(
                                 row,
                                 format!(
-                                "Wrong number of arguments to #eq? predicate. Expected 2, got {}.",
-                                p.len() - 1
-                            ),
+                                    "Wrong number of arguments to #eq? predicate. Expected 2, got {}.",
+                                    p.len() - 1
+                                ),
                             ));
                         }
                         if p[1].type_ != TYPE_CAPTURE {
-                            return Err(predicate_error(row, format!(
-                                "First argument to #eq? predicate must be a capture name. Got literal \"{}\".",
-                                string_values[p[1].value_id as usize],
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "First argument to #eq? predicate must be a capture name. Got literal \"{}\".",
+                                    string_values[p[1].value_id as usize],
+                                ),
+                            ));
                         }
 
                         let is_positive = operator_name == "eq?" || operator_name == "any-eq?";
@@ -2025,22 +2754,31 @@ impl Query {
 
                     "match?" | "not-match?" | "any-match?" | "any-not-match?" => {
                         if p.len() != 3 {
-                            return Err(predicate_error(row, format!(
-                                "Wrong number of arguments to #match? predicate. Expected 2, got {}.",
-                                p.len() - 1
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "Wrong number of arguments to #match? predicate. Expected 2, got {}.",
+                                    p.len() - 1
+                                ),
+                            ));
                         }
                         if p[1].type_ != TYPE_CAPTURE {
-                            return Err(predicate_error(row, format!(
-                                "First argument to #match? predicate must be a capture name. Got literal \"{}\".",
-                                string_values[p[1].value_id as usize],
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "First argument to #match? predicate must be a capture name. Got literal \"{}\".",
+                                    string_values[p[1].value_id as usize],
+                                ),
+                            ));
                         }
                         if p[2].type_ == TYPE_CAPTURE {
-                            return Err(predicate_error(row, format!(
-                                "Second argument to #match? predicate must be a literal. Got capture @{}.",
-                                capture_names[p[2].value_id as usize],
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "Second argument to #match? predicate must be a literal. Got capture @{}.",
+                                    capture_names[p[2].value_id as usize],
+                                ),
+                            ));
                         }
 
                         let is_positive =
@@ -2082,26 +2820,35 @@ impl Query {
 
                     "any-of?" | "not-any-of?" => {
                         if p.len() < 2 {
-                            return Err(predicate_error(row, format!(
-                                "Wrong number of arguments to #any-of? predicate. Expected at least 1, got {}.",
-                                p.len() - 1
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "Wrong number of arguments to #any-of? predicate. Expected at least 1, got {}.",
+                                    p.len() - 1
+                                ),
+                            ));
                         }
                         if p[1].type_ != TYPE_CAPTURE {
-                            return Err(predicate_error(row, format!(
-                                "First argument to #any-of? predicate must be a capture name. Got literal \"{}\".",
-                                string_values[p[1].value_id as usize],
-                            )));
+                            return Err(predicate_error(
+                                row,
+                                format!(
+                                    "First argument to #any-of? predicate must be a capture name. Got literal \"{}\".",
+                                    string_values[p[1].value_id as usize],
+                                ),
+                            ));
                         }
 
                         let is_positive = operator_name == "any-of?";
                         let mut values = Vec::new();
                         for arg in &p[2..] {
                             if arg.type_ == TYPE_CAPTURE {
-                                return Err(predicate_error(row, format!(
-                                    "Arguments to #any-of? predicate must be literals. Got capture @{}.",
-                                    capture_names[arg.value_id as usize],
-                                )));
+                                return Err(predicate_error(
+                                    row,
+                                    format!(
+                                        "Arguments to #any-of? predicate must be literals. Got capture @{}.",
+                                        capture_names[arg.value_id as usize],
+                                    ),
+                                ));
                             }
                             values.push(string_values[arg.value_id as usize]);
                         }
@@ -2265,6 +3012,23 @@ impl Query {
         unsafe { ffi::ts_query_disable_pattern(self.ptr.as_ptr(), index as u32) }
     }
 
+    /// Create a deep copy of this query.
+    ///
+    /// Queries are shareable across threads and cursors without cloning. You
+    /// should only need this when you want an independent copy to mutate (e.g.
+    /// via [`disable_capture`][Query::disable_capture] or
+    /// [`disable_pattern`][Query::disable_pattern]).
+    #[doc(alias = "ts_query_copy")]
+    #[must_use]
+    pub fn deep_clone(&self) -> Self {
+        let ptr = unsafe { ffi::ts_query_copy(self.ptr.as_ptr()) };
+        // SAFETY: from_raw_parts re-derives all Rust-side fields from the C
+        // object. The source string is only used for predicate error row
+        // numbers. Since this is a copy of an already-valid query, it cannot
+        // return an error.
+        unsafe { Self::from_raw_parts(ptr, "").unwrap_unchecked() }
+    }
+
     /// Check if a given pattern within a query has a single root node.
     #[doc(alias = "ts_query_is_pattern_rooted")]
     #[must_use]
@@ -2344,7 +3108,7 @@ impl Query {
         } else {
             Err(predicate_error(
                 row,
-                format!("Invalid arguments to {function_name} predicate. Missing key argument",),
+                format!("Invalid arguments to {function_name} predicate. Missing key argument"),
             ))
         }
     }
@@ -2385,26 +3149,6 @@ impl QueryCursor {
         }
     }
 
-    /// Set the maximum duration in microseconds that query execution should be allowed to
-    /// take before halting.
-    ///
-    /// If query execution takes longer than this, it will halt early, returning None.
-    #[doc(alias = "ts_query_cursor_set_timeout_micros")]
-    pub fn set_timeout_micros(&mut self, timeout: u64) {
-        unsafe {
-            ffi::ts_query_cursor_set_timeout_micros(self.ptr.as_ptr(), timeout);
-        }
-    }
-
-    /// Get the duration in microseconds that query execution is allowed to take.
-    ///
-    /// This is set via [`set_timeout_micros`](QueryCursor::set_timeout_micros).
-    #[doc(alias = "ts_query_cursor_timeout_micros")]
-    #[must_use]
-    pub fn timeout_micros(&self) -> u64 {
-        unsafe { ffi::ts_query_cursor_timeout_micros(self.ptr.as_ptr()) }
-    }
-
     /// Check if, on its last execution, this cursor exceeded its maximum number
     /// of in-progress matches.
     #[doc(alias = "ts_query_cursor_did_exceed_match_limit")]
@@ -2419,13 +3163,17 @@ impl QueryCursor {
     /// captures. Because multiple patterns can match the same set of nodes,
     /// one match may contain captures that appear *before* some of the
     /// captures from a previous match.
+    ///
+    /// Iterating over a `QueryMatches` object requires the `StreamingIterator`
+    /// or `StreamingIteratorMut` trait to be in scope. This can be done via
+    /// `use tree_sitter::StreamingIterator` or `use tree_sitter::StreamingIteratorMut`
     #[doc(alias = "ts_query_cursor_exec")]
     pub fn matches<'query, 'cursor: 'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>>(
         &'cursor mut self,
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-    ) -> QueryMatches<'query, 'tree, T, I> {
+    ) -> QueryMatches<'query, 'tree, 'static, T, I> {
         let ptr = self.ptr.as_ptr();
         unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
         QueryMatches {
@@ -2434,6 +3182,74 @@ impl QueryCursor {
             text_provider,
             buffer1: Vec::default(),
             buffer2: Vec::default(),
+            current_match: None,
+            _options: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Iterate over all of the matches in the order that they were found, with options.
+    ///
+    /// Each match contains the index of the pattern that matched, and a list of
+    /// captures. Because multiple patterns can match the same set of nodes,
+    /// one match may contain captures that appear *before* some of the
+    /// captures from a previous match.
+    #[doc(alias = "ts_query_cursor_exec_with_options")]
+    pub fn matches_with_options<
+        'query,
+        'cursor: 'query,
+        'tree,
+        'options,
+        T: TextProvider<I>,
+        I: AsRef<[u8]>,
+    >(
+        &'cursor mut self,
+        query: &'query Query,
+        node: Node<'tree>,
+        text_provider: T,
+        options: QueryCursorOptions<'options>,
+    ) -> QueryMatches<'query, 'tree, 'options, T, I> {
+        unsafe extern "C" fn progress(state: *mut ffi::TSQueryCursorState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<QueryProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&QueryCursorState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
+
+        let query_options = options.progress_callback.map(|cb| {
+            QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                })),
+                PhantomData,
+            )
+        });
+
+        let ptr = self.ptr.as_ptr();
+        unsafe {
+            ffi::ts_query_cursor_exec_with_options(
+                ptr,
+                query.ptr.as_ptr(),
+                node.0,
+                query_options.as_ref().map_or(ptr::null_mut(), |q| q.0),
+            );
+        }
+        QueryMatches {
+            ptr,
+            query,
+            text_provider,
+            buffer1: Vec::default(),
+            buffer2: Vec::default(),
+            current_match: None,
+            _options: query_options,
             _phantom: PhantomData,
         }
     }
@@ -2443,13 +3259,17 @@ impl QueryCursor {
     ///
     /// This is useful if you don't care about which pattern matched, and just
     /// want a single, ordered sequence of captures.
+    ///
+    /// Iterating over a `QueryCaptures` object requires the `StreamingIterator`
+    /// or `StreamingIteratorMut` trait to be in scope. This can be done via
+    /// `use tree_sitter::StreamingIterator` or `use tree_sitter::StreamingIteratorMut`
     #[doc(alias = "ts_query_cursor_exec")]
     pub fn captures<'query, 'cursor: 'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>>(
         &'cursor mut self,
         query: &'query Query,
         node: Node<'tree>,
         text_provider: T,
-    ) -> QueryCaptures<'query, 'tree, T, I> {
+    ) -> QueryCaptures<'query, 'tree, 'static, T, I> {
         let ptr = self.ptr.as_ptr();
         unsafe { ffi::ts_query_cursor_exec(ptr, query.ptr.as_ptr(), node.0) };
         QueryCaptures {
@@ -2458,6 +3278,73 @@ impl QueryCursor {
             text_provider,
             buffer1: Vec::default(),
             buffer2: Vec::default(),
+            current_match: None,
+            _options: None,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Iterate over all of the individual captures in the order that they
+    /// appear, with options.
+    ///
+    /// This is useful if you don't care about which pattern matched, and just
+    /// want a single, ordered sequence of captures.
+    #[doc(alias = "ts_query_cursor_exec")]
+    pub fn captures_with_options<
+        'query,
+        'cursor: 'query,
+        'tree,
+        'options,
+        T: TextProvider<I>,
+        I: AsRef<[u8]>,
+    >(
+        &'cursor mut self,
+        query: &'query Query,
+        node: Node<'tree>,
+        text_provider: T,
+        options: QueryCursorOptions<'options>,
+    ) -> QueryCaptures<'query, 'tree, 'options, T, I> {
+        unsafe extern "C" fn progress(state: *mut ffi::TSQueryCursorState) -> bool {
+            unsafe {
+                let callback = (*state)
+                    .payload
+                    .cast::<QueryProgressCallback>()
+                    .as_mut()
+                    .unwrap();
+                match callback(&QueryCursorState::from_raw(state)) {
+                    ControlFlow::Continue(()) => false,
+                    ControlFlow::Break(()) => true,
+                }
+            }
+        }
+
+        let query_options = options.progress_callback.map(|cb| {
+            QueryCursorOptionsDrop(
+                Box::into_raw(Box::new(ffi::TSQueryCursorOptions {
+                    payload: Box::into_raw(Box::new(cb)).cast::<c_void>(),
+                    progress_callback: Some(progress),
+                })),
+                PhantomData,
+            )
+        });
+
+        let ptr = self.ptr.as_ptr();
+        unsafe {
+            ffi::ts_query_cursor_exec_with_options(
+                ptr,
+                query.ptr.as_ptr(),
+                node.0,
+                query_options.as_ref().map_or(ptr::null_mut(), |q| q.0),
+            );
+        }
+        QueryCaptures {
+            ptr,
+            query,
+            text_provider,
+            buffer1: Vec::default(),
+            buffer2: Vec::default(),
+            current_match: None,
+            _options: query_options,
             _phantom: PhantomData,
         }
     }
@@ -2490,6 +3377,44 @@ impl QueryCursor {
         self
     }
 
+    /// Set the byte range within which all matches must be fully contained.
+    ///
+    /// Set the range of bytes in which matches will be searched for. In contrast to
+    /// `ts_query_cursor_set_byte_range`, this will restrict the query cursor to only return
+    /// matches where _all_ nodes are _fully_ contained within the given range. Both functions
+    /// can be used together, e.g. to search for any matches that intersect line 5000, as
+    /// long as they are fully contained within lines 4500-5500
+    #[doc(alias = "ts_query_cursor_set_containing_byte_range")]
+    pub fn set_containing_byte_range(&mut self, range: ops::Range<usize>) -> &mut Self {
+        unsafe {
+            ffi::ts_query_cursor_set_containing_byte_range(
+                self.ptr.as_ptr(),
+                range.start as u32,
+                range.end as u32,
+            );
+        }
+        self
+    }
+
+    /// Set the point range within which all matches must be fully contained.
+    ///
+    /// Set the range of bytes in which matches will be searched for. In contrast to
+    /// `ts_query_cursor_set_point_range`, this will restrict the query cursor to only return
+    /// matches where _all_ nodes are _fully_ contained within the given range. Both functions
+    /// can be used together, e.g. to search for any matches that intersect line 5000, as
+    /// long as they are fully contained within lines 4500-5500
+    #[doc(alias = "ts_query_cursor_set_containing_point_range")]
+    pub fn set_containing_point_range(&mut self, range: ops::Range<Point>) -> &mut Self {
+        unsafe {
+            ffi::ts_query_cursor_set_containing_point_range(
+                self.ptr.as_ptr(),
+                range.start.into(),
+                range.end.into(),
+            );
+        }
+        self
+    }
+
     /// Set the maximum start depth for a query cursor.
     ///
     /// This prevents cursors from exploring children nodes at a certain depth.
@@ -2499,9 +3424,9 @@ impl QueryCursor {
     /// The zero max start depth value can be used as a special behavior and
     /// it helps to destructure a subtree by staying on a node and using
     /// captures for interested parts. Note that the zero max start depth
-    /// only limit a search depth for a pattern's root node but other nodes
-    /// that are parts of the pattern may be searched at any depth what
-    /// defined by the pattern structure.
+    /// only limits a search depth for a pattern's root node but other nodes
+    /// that are parts of the pattern may be searched at any depth depending on
+    /// what is defined by the pattern structure.
     ///
     /// Set to `None` to remove the maximum start depth.
     #[doc(alias = "ts_query_cursor_set_max_start_depth")]
@@ -2522,8 +3447,13 @@ impl<'tree> QueryMatch<'_, 'tree> {
         self.id
     }
 
+    #[must_use]
+    pub const fn captures(&self) -> &[QueryCapture<'tree>] {
+        self.captures
+    }
+
     #[doc(alias = "ts_query_cursor_remove_match")]
-    pub fn remove(self) {
+    pub fn remove(&self) {
         unsafe { ffi::ts_query_cursor_remove_match(self.cursor, self.id) }
     }
 
@@ -2541,18 +3471,20 @@ impl<'tree> QueryMatch<'_, 'tree> {
             cursor,
             id: m.id,
             pattern_index: m.pattern_index as usize,
-            captures: (m.capture_count > 0)
-                .then(|| unsafe {
+            captures: if m.capture_count > 0 {
+                unsafe {
                     slice::from_raw_parts(
                         m.captures.cast::<QueryCapture<'tree>>(),
                         m.capture_count as usize,
                     )
-                })
-                .unwrap_or_default(),
+                }
+            } else {
+                Default::default()
+            },
         }
     }
 
-    fn satisfies_text_predicates<I: AsRef<[u8]>>(
+    pub fn satisfies_text_predicates<I: AsRef<[u8]>>(
         &self,
         query: &Query,
         buffer1: &mut Vec<u8>,
@@ -2564,7 +3496,7 @@ impl<'tree> QueryMatch<'_, 'tree> {
             first_chunk: Option<T>,
         }
         impl<'a, T: AsRef<[u8]>> NodeText<'a, T> {
-            fn new(buffer: &'a mut Vec<u8>) -> Self {
+            const fn new(buffer: &'a mut Vec<u8>) -> Self {
                 Self {
                     buffer,
                     first_chunk: None,
@@ -2597,9 +3529,11 @@ impl<'tree> QueryMatch<'_, 'tree> {
             .iter()
             .all(|predicate| match predicate {
                 TextPredicateCapture::EqCapture(i, j, is_positive, match_all_nodes) => {
-                    let mut nodes_1 = self.nodes_for_capture_index(*i);
-                    let mut nodes_2 = self.nodes_for_capture_index(*j);
-                    while let (Some(node1), Some(node2)) = (nodes_1.next(), nodes_2.next()) {
+                    let mut nodes_1 = self.nodes_for_capture_index(*i).peekable();
+                    let mut nodes_2 = self.nodes_for_capture_index(*j).peekable();
+                    while nodes_1.peek().is_some() && nodes_2.peek().is_some() {
+                        let node1 = nodes_1.next().unwrap();
+                        let node2 = nodes_2.next().unwrap();
                         let mut text1 = text_provider.text(node1);
                         let mut text2 = text_provider.text(node2);
                         let text1 = node_text1.get_text(&mut text1);
@@ -2670,13 +3604,16 @@ impl QueryProperty {
     }
 }
 
-impl<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> Iterator
-    for QueryMatches<'query, 'tree, T, I>
+/// Provide a `StreamingIterator` instead of the traditional `Iterator`, as the
+/// underlying object in the C library gets updated on each iteration. Copies would
+/// have their internal state overwritten, leading to Undefined Behavior
+impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
+    for QueryMatches<'query, 'tree, '_, T, I>
 {
     type Item = QueryMatch<'query, 'tree>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
+    fn advance(&mut self) {
+        self.current_match = unsafe {
             loop {
                 let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
                 if ffi::ts_query_cursor_next_match(self.ptr, m.as_mut_ptr()) {
@@ -2687,23 +3624,33 @@ impl<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> Iterator
                         &mut self.buffer2,
                         &mut self.text_provider,
                     ) {
-                        return Some(result);
+                        break Some(result);
                     }
                 } else {
-                    return None;
+                    break None;
                 }
             }
-        }
+        };
+    }
+
+    fn get(&self) -> Option<&Self::Item> {
+        self.current_match.as_ref()
     }
 }
 
-impl<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> Iterator
-    for QueryCaptures<'query, 'tree, T, I>
+impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryMatches<'_, '_, '_, T, I> {
+    fn get_mut(&mut self) -> Option<&mut Self::Item> {
+        self.current_match.as_mut()
+    }
+}
+
+impl<'query, 'tree, T: TextProvider<I>, I: AsRef<[u8]>> StreamingIterator
+    for QueryCaptures<'query, 'tree, '_, T, I>
 {
     type Item = (QueryMatch<'query, 'tree>, usize);
 
-    fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
+    fn advance(&mut self) {
+        self.current_match = unsafe {
             loop {
                 let mut capture_index = 0u32;
                 let mut m = MaybeUninit::<ffi::TSQueryMatch>::uninit();
@@ -2719,18 +3666,28 @@ impl<'query, 'tree: 'query, T: TextProvider<I>, I: AsRef<[u8]>> Iterator
                         &mut self.buffer2,
                         &mut self.text_provider,
                     ) {
-                        return Some((result, capture_index as usize));
+                        break Some((result, capture_index as usize));
                     }
                     result.remove();
                 } else {
-                    return None;
+                    break None;
                 }
             }
         }
     }
+
+    fn get(&self) -> Option<&Self::Item> {
+        self.current_match.as_ref()
+    }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> StreamingIteratorMut for QueryCaptures<'_, '_, '_, T, I> {
+    fn get_mut(&mut self) -> Option<&mut Self::Item> {
+        self.current_match.as_mut()
+    }
+}
+
+impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, '_, T, I> {
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) {
         unsafe {
@@ -2746,7 +3703,7 @@ impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryMatches<'_, '_, T, I> {
     }
 }
 
-impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryCaptures<'_, '_, T, I> {
+impl<T: TextProvider<I>, I: AsRef<[u8]>> QueryCaptures<'_, '_, '_, T, I> {
     #[doc(alias = "ts_query_cursor_set_byte_range")]
     pub fn set_byte_range(&mut self, range: ops::Range<usize>) {
         unsafe {
@@ -2864,8 +3821,8 @@ impl From<ffi::TSRange> for Range {
     }
 }
 
-impl From<&'_ InputEdit> for ffi::TSInputEdit {
-    fn from(val: &'_ InputEdit) -> Self {
+impl From<&InputEdit> for ffi::TSInputEdit {
+    fn from(val: &InputEdit) -> Self {
         Self {
             start_byte: val.start_byte as u32,
             old_end_byte: val.old_end_byte as u32,
@@ -2943,11 +3900,21 @@ impl fmt::Display for IncludedRangesError {
 
 impl fmt::Display for LanguageError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Incompatible language version {}. Expected minimum {}, maximum {}",
-            self.version, MIN_COMPATIBLE_LANGUAGE_VERSION, LANGUAGE_VERSION,
-        )
+        match self {
+            Self::Version(version) => {
+                write!(
+                    f,
+                    "Incompatible language version {version}. Expected minimum {MIN_COMPATIBLE_LANGUAGE_VERSION}, maximum {LANGUAGE_VERSION}",
+                )
+            }
+            Self::NotParseable => {
+                write!(f, "Language cannot be used for parsing.")
+            }
+            #[cfg(feature = "wasm")]
+            Self::Wasm => {
+                write!(f, "Failed to load the Wasm store.")
+            }
+        }
     }
 }
 
@@ -2981,11 +3948,11 @@ impl fmt::Display for QueryError {
 #[must_use]
 pub fn format_sexp(sexp: &str, initial_indent_level: usize) -> String {
     let mut indent_level = initial_indent_level;
-    let mut formatted = String::new();
+    let mut formatted = String::with_capacity(sexp.len());
     let mut has_field = false;
 
     let mut c_iter = sexp.chars().peekable();
-    let mut s = String::with_capacity(sexp.len());
+    let mut scratch = String::with_capacity(sexp.len());
     let mut quote = '\0';
     let mut saw_paren = false;
     let mut did_last = false;
@@ -2996,14 +3963,14 @@ pub fn format_sexp(sexp: &str, initial_indent_level: usize) -> String {
             if c == '\'' || c == '"' {
                 quote = c;
             } else if c == ' ' || (c == ')' && quote != '\0') {
-                if let Some(next_c) = c_iter.peek() {
-                    if *next_c == quote {
-                        next.push(c);
-                        next.push(*next_c);
-                        c_iter.next();
-                        quote = '\0';
-                        continue;
-                    }
+                if let Some(next_c) = c_iter.peek()
+                    && *next_c == quote
+                {
+                    next.push(c);
+                    next.push(*next_c);
+                    c_iter.next();
+                    quote = '\0';
+                    continue;
                 }
                 break;
             }
@@ -3031,12 +3998,12 @@ pub fn format_sexp(sexp: &str, initial_indent_level: usize) -> String {
         Some(())
     };
 
-    while fetch_next_str(&mut s).is_some() {
-        if s.is_empty() && indent_level > 0 {
+    while fetch_next_str(&mut scratch).is_some() {
+        if scratch.is_empty() && indent_level > 0 {
             // ")"
             indent_level -= 1;
             write!(formatted, ")").unwrap();
-        } else if s.starts_with('(') {
+        } else if scratch.starts_with('(') {
             if has_field {
                 has_field = false;
             } else {
@@ -3050,27 +4017,27 @@ pub fn format_sexp(sexp: &str, initial_indent_level: usize) -> String {
             }
 
             // "(node_name"
-            write!(formatted, "{s}").unwrap();
+            write!(formatted, "{scratch}").unwrap();
 
             // "(MISSING node_name" or "(UNEXPECTED 'x'"
-            if s.starts_with("(MISSING") || s.starts_with("(UNEXPECTED") {
-                fetch_next_str(&mut s).unwrap();
-                if s.is_empty() {
+            if scratch.starts_with("(MISSING") || scratch.starts_with("(UNEXPECTED") {
+                fetch_next_str(&mut scratch).unwrap();
+                if scratch.is_empty() {
                     while indent_level > 0 {
                         indent_level -= 1;
                         write!(formatted, ")").unwrap();
                     }
                 } else {
-                    write!(formatted, " {s}").unwrap();
+                    write!(formatted, " {scratch}").unwrap();
                 }
             }
-        } else if s.ends_with(':') {
+        } else if scratch.ends_with(':') {
             // "field:"
             writeln!(formatted).unwrap();
             for _ in 0..indent_level {
                 write!(formatted, "  ").unwrap();
             }
-            write!(formatted, "{s} ").unwrap();
+            write!(formatted, "{scratch} ").unwrap();
             has_field = true;
             indent_level += 1;
         }
@@ -3087,48 +4054,90 @@ pub fn wasm_stdlib_symbols() -> impl Iterator<Item = &'static str> {
         .map(|s| s.trim_matches(|c| c == '"' || c == ','))
 }
 
-extern "C" {
-    fn free(ptr: *mut c_void);
+unsafe extern "C" {
+    static mut ts_current_free: unsafe extern "C" fn(ptr: *mut c_void);
 }
 
-static mut FREE_FN: unsafe extern "C" fn(ptr: *mut c_void) = free;
+/// Frees a pointer that was returned by a tree-sitter C API using whichever `free`
+/// function is currently installed via [`set_allocator`] or [`ffi::ts_set_allocator`].
+#[inline]
+unsafe fn ts_free(ptr: *mut c_void) {
+    let f = unsafe { core::ptr::addr_of!(ts_current_free).read() };
+    unsafe { f(ptr) };
+}
 
-/// Sets the memory allocation functions that the core library should use.
+/// A complete set of memory allocation functions for the core C library.
+#[derive(Copy, Clone)]
+pub struct Allocator {
+    pub malloc: unsafe extern "C" fn(size: usize) -> *mut c_void,
+    pub calloc: unsafe extern "C" fn(nmemb: usize, size: usize) -> *mut c_void,
+    pub realloc: unsafe extern "C" fn(ptr: *mut c_void, size: usize) -> *mut c_void,
+    pub free: unsafe extern "C" fn(ptr: *mut c_void),
+}
+
+/// Replaces the memory allocation functions used by the core C library.
+///
+/// Pass `Some` to install an allocator, or `None` to restore libc defaults.
 ///
 /// # Safety
 ///
-/// This function uses FFI and mutates a static global.
+/// All of the following must hold:
+///
+/// - The four functions must belong to a single allocator family.
+///
+/// - The functions must not return null for non-zero allocs.
+///
+/// - Returned pointers must satisfy the alignment that libc `malloc` provides.
+///
+/// - Call this before any other tree-sitter API call, and do not call it again
+///   while live tree-sitter objects exist.
+///
+/// - This function is not thread-safe.
 #[doc(alias = "ts_set_allocator")]
-pub unsafe fn set_allocator(
-    new_malloc: Option<unsafe extern "C" fn(usize) -> *mut c_void>,
-    new_calloc: Option<unsafe extern "C" fn(usize, usize) -> *mut c_void>,
-    new_realloc: Option<unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void>,
-    new_free: Option<unsafe extern "C" fn(*mut c_void)>,
-) {
-    FREE_FN = new_free.unwrap_or(free);
-    ffi::ts_set_allocator(new_malloc, new_calloc, new_realloc, new_free);
+pub unsafe fn set_allocator(allocator: Option<Allocator>) {
+    let (m, c, r, f) = match allocator {
+        Some(a) => (
+            Some(a.malloc),
+            Some(a.calloc),
+            Some(a.realloc),
+            Some(a.free),
+        ),
+        None => (None, None, None, None),
+    };
+    unsafe { ffi::ts_set_allocator(m, c, r, f) };
 }
 
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl error::Error for IncludedRangesError {}
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl error::Error for LanguageError {}
 #[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 impl error::Error for QueryError {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for Language {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for Language {}
 
 unsafe impl Send for Node<'_> {}
 unsafe impl Sync for Node<'_> {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for LookaheadIterator {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for LookaheadIterator {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for LookaheadNamesIterator<'_> {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for LookaheadNamesIterator<'_> {}
 
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Send for Parser {}
+#[cfg(not(target_family = "wasm"))]
 unsafe impl Sync for Parser {}
 
 unsafe impl Send for Query {}

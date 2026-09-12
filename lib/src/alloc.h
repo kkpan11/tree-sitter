@@ -9,16 +9,16 @@ extern "C" {
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(TREE_SITTER_HIDDEN_SYMBOLS) || defined(_WIN32)
+#if defined(TREE_SITTER_HIDE_SYMBOLS) || defined(_WIN32)
 #define TS_PUBLIC
 #else
 #define TS_PUBLIC __attribute__((visibility("default")))
 #endif
 
-TS_PUBLIC extern void *(*ts_current_malloc)(size_t);
-TS_PUBLIC extern void *(*ts_current_calloc)(size_t, size_t);
-TS_PUBLIC extern void *(*ts_current_realloc)(void *, size_t);
-TS_PUBLIC extern void (*ts_current_free)(void *);
+TS_PUBLIC extern void *(*ts_current_malloc)(size_t size);
+TS_PUBLIC extern void *(*ts_current_calloc)(size_t count, size_t size);
+TS_PUBLIC extern void *(*ts_current_realloc)(void *ptr, size_t size);
+TS_PUBLIC extern void (*ts_current_free)(void *ptr);
 
 // Allow clients to override allocation functions
 #ifndef ts_malloc

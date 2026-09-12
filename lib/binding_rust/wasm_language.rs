@@ -8,12 +8,12 @@ use std::{
 
 pub use wasmtime_c_api::wasmtime;
 
-use crate::{ffi, Language, LanguageError, Parser, FREE_FN};
+use crate::{Language, LanguageError, Parser, ffi, ts_free};
 
 // Force Cargo to include wasmtime-c-api as a dependency of this crate,
 // even though it is only used by the C code.
-#[allow(unused)]
-fn _use_wasmtime() {
+#[expect(unused, reason = "forces Cargo to link wasmtime-c-api")]
+fn use_wasmtime() {
     wasmtime_c_api::wasm_engine_new();
 }
 
@@ -25,6 +25,9 @@ pub struct wasm_engine_t {
 }
 
 pub struct WasmStore(*mut ffi::TSWasmStore);
+
+unsafe impl Send for WasmStore {}
+unsafe impl Sync for WasmStore {}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct WasmError {
@@ -45,7 +48,9 @@ impl WasmStore {
         unsafe {
             let mut error = MaybeUninit::<ffi::TSWasmError>::uninit();
             let store = ffi::ts_wasm_store_new(
-                (engine as *const wasmtime::Engine as *mut wasmtime::Engine).cast(),
+                std::ptr::from_ref::<wasmtime::Engine>(engine)
+                    .cast_mut()
+                    .cast(),
                 error.as_mut_ptr(),
             );
             if store.is_null() {
@@ -83,8 +88,11 @@ impl WasmStore {
 
 impl WasmError {
     unsafe fn new(error: ffi::TSWasmError) -> Self {
-        let message = CStr::from_ptr(error.message).to_str().unwrap().to_string();
-        (FREE_FN)(error.message.cast());
+        let message = unsafe { CStr::from_ptr(error.message) }
+            .to_str()
+            .unwrap()
+            .to_string();
+        unsafe { ts_free(error.message.cast()) };
         Self {
             kind: match error.kind {
                 ffi::TSWasmErrorKindParse => WasmErrorKind::Parse,
@@ -130,9 +138,9 @@ impl Drop for WasmStore {
 impl fmt::Display for WasmError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let kind = match self.kind {
-            WasmErrorKind::Parse => "Failed to parse wasm",
-            WasmErrorKind::Compile => "Failed to compile wasm",
-            WasmErrorKind::Instantiate => "Failed to instantiate wasm module",
+            WasmErrorKind::Parse => "Failed to parse Wasm",
+            WasmErrorKind::Compile => "Failed to compile Wasm",
+            WasmErrorKind::Instantiate => "Failed to instantiate Wasm module",
             WasmErrorKind::Other => "Unknown error",
         };
         write!(f, "{kind}: {}", self.message)

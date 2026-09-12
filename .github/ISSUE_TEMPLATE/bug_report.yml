@@ -1,7 +1,15 @@
 name: Bug Report
 description: Report a problem
-labels: [bug]
+type: Bug
 body:
+  - type: checkboxes
+    attributes:
+      label: AI Policy
+      description: Review our [AI Policy](https://tree-sitter.github.io/tree-sitter/6-contributing.html#ai-policy).
+      options:
+        - label: I have read the AI Policy and this issue complies with it.
+          required: true
+
   - type: textarea
     attributes:
       label: "Problem"
@@ -13,9 +21,11 @@ body:
     attributes:
       label: "Steps to reproduce"
       placeholder: |
+        ```sh
         git clone --depth=1 https://github.com/tree-sitter/tree-sitter-ruby
         cd tree-sitter-ruby
         tree-sitter generate
+        ```
     validations:
       required: true
 

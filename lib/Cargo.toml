@@ -4,13 +4,14 @@ version.workspace = true
 description = "Rust bindings to the Tree-sitter parsing library"
 authors.workspace = true
 edition.workspace = true
-rust-version = "1.65"
+rust-version = "1.90"
 readme = "binding_rust/README.md"
 homepage.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/tree-sitter"
 license.workspace = true
 keywords.workspace = true
-categories = ["api-bindings", "parsing", "text-editors"]
+categories = [ "api-bindings", "external-ffi-bindings", "parsing", "text-editors" ]
 
 build = "binding_rust/build.rs"
 links = "tree-sitter"
@@ -20,31 +21,42 @@ include = [
   "/Cargo.toml",
   "/src/*.h",
   "/src/*.c",
+  "/src/portable/*",
   "/src/unicode/*",
-  "/src/wasm/*",
+  "/src/wasm-stdlib/**/*",
   "/include/tree_sitter/api.h",
+  "/LICENSE",
 ]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [ "--cfg", "docsrs" ]
+targets = [ "x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu" ]
+
+[lints]
+workspace = true
+
 [features]
-default = ["std"]
-std = ["regex/std", "regex/perf", "regex-syntax/unicode"]
-wasm = ["wasmtime-c-api"]
+default = [ "std" ]
+std = [ "regex/std", "regex/perf" ]
+wasm = [ "std", "wasmtime-c-api" ]
 
 [dependencies]
-regex = { version = "1.10.6", default-features = false, features = ["unicode"] }
-regex-syntax = { version = "0.8.4", default-features = false }
-tree-sitter-language = { version = "0.1", path = "language" }
+regex = { default-features = false, features = [ "unicode" ], version = "1.12.3" }
+streaming-iterator = "0.1.9"
+tree-sitter-language.workspace = true
 
 [dependencies.wasmtime-c-api]
-version = "24.0.0"
+default-features = false
+features = [ "cranelift", "gc", "gc-null" ]
 optional = true
 package = "wasmtime-c-api-impl"
-default-features = false
-features = ["cranelift"]
+version = "48.0.2"
 
 [build-dependencies]
-bindgen = { version = "0.70.1", optional = true }
+bindgen = { optional = true, version = "0.72.1" }
 cc.workspace = true
+serde_json.workspace = true
 
 [lib]
 path = "binding_rust/lib.rs"
